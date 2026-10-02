@@ -1,0 +1,348 @@
+= VO vs. DTO: Definitions and the History of Conflating the Terms
+Sanghyuk Jung
+2026-10-03
+:jbake-type: post
+:jbake-status: published
+:jbake-tags: java, ddd, convention, code-review
+:description: Calling a getter/setter data carrier a VO (Value Object) causes confusion. A Value Object is a classification by meaning and value equality, while a DTO is a classification by its role of transferring data. This article walks through both definitions, how Core J2EE Patterns spread the conflation in the Java/J2EE world, and a naming convention that keeps roles visible.
+:idprefix:
+:toc:
+
+In practice, you often come across objects with nothing but getters and setters, whose job is to carry values, being called VOs (Value Objects). If the object's role is to carry data across a remote call between processes, calling it a DTO (Data Transfer Object) leaves less room for confusion. Value Object is a term that Martin Fowler's writing and Eric Evans's DDD (Domain-Driven Design) have already defined with a different meaning. This article lays out the definitions of the two patterns and the history of how the terms got mixed up.
+
+== Definition of Value Object
+
+A Value Object is an object that has no identity and whose equality is determined by the values it holds.
+
+Identity is the property that distinguishes one object from another regardless of its attribute values. A member is still the same member after their name or address changes, and two members with the same name and address are still different people. Such objects are distinguished by an identifier like a member number, and DDD calls them ENTITIES.
+
+Equality is the criterion for deciding whether two objects count as the same. A Value Object bases this criterion on the values it holds rather than on an identifier. Concepts like money, color, and date are typical examples. For instance, `Instant` in Java, which represents a point on the timeline, compares equal with `equals()` when two instances refer to the same instant, even if they were created separately by different means.
+
+[source,java]
+----
+Instant fromText = Instant.parse("2026-09-24T20:00:00Z");
+Instant fromSeoulTime = ZonedDateTime.of(2026, 9, 25, 5, 0, 0, 0, ZoneId.of("Asia/Seoul"))
+    .toInstant();
+
+assertThat(fromText).isEqualTo(fromSeoulTime); // 20:00 on the 24th UTC and 05:00 on the 25th in Seoul are the same instant
+----
+
+This definition can be confirmed in the three sources below.
+
+* link:https://martinfowler.com/bliki/ValueObject.html[Martin Fowler's article]: objects regarded as equal because their attribute values are equal. He explains this using a point made up of x and y coordinates as the example.
++
+____
+Objects that are equal due to the value of their properties, in this case their x and y coordinates, are called value objects.
+____
+* link:https://en.wikipedia.org/wiki/Value_object[Wikipedia]: an object whose equality is not based on identity, and which counts as the same when it holds the same values
+* link:https://learn.microsoft.com/en-us/dotnet/architecture/microservices/microservice-ddd-cqrs-patterns/implement-value-objects[Microsoft's .NET architecture documentation]: an object with no identity
+
+Eric Evans takes the same view. In the Value Objects entry of the link:https://www.domainlanguage.com/wp-content/uploads/2016/05/DDD_Reference_2015-03.pdf[Domain-Driven Design Reference] (2015), which Evans published as a summary of the pattern definitions in **Domain-Driven Design**, the problem statement presupposes that many objects have no conceptual identity, and it says to classify a model element as a value object when you care only about its attributes and logic.
+
+[quote, Eric Evans, Domain-Driven Design Reference: Value Objects]
+____
+Some objects describe or compute some characteristic of a thing. Many objects have no conceptual identity. ...
+
+Therefore:
+
+When you care only about the attributes and logic of an element of the model, classify it as a value object. Make it express the meaning of the attributes it conveys and give it related functionality.
+____
+
+In Java code, a class that expresses a value concept becomes a Value Object when it implements `equals()` and `hashCode()` on the attributes that serve as the criterion for equality. The contracts of these two methods that must be honored are laid out in Item 10 and Item 11 of Joshua Bloch's **Effective Java**, 3rd ed.
+
+* Item 10: the general contract of `equals()`
+** Reflexive: `x.equals(x)` returns `true`.
+** Symmetric: if `x.equals(y)` returns `true`, then `y.equals(x)` also returns `true`.
+** Transitive: if `x.equals(y)` and `y.equals(z)` return `true`, then `x.equals(z)` also returns `true`.
+** Consistent: as long as the information used in the comparison does not change, `x.equals(y)` returns the same result no matter how many times it is called.
+** Non-null: `x.equals(null)` returns `false`.
+* Item 11: when you override `equals()`, also override `hashCode()`
+** As long as the information used in `equals()` comparisons does not change, `hashCode()` returns the same value no matter how many times it is called.
+** Two objects that are equal according to `equals()` return the same `hashCode()` value.
+** Two objects that are unequal according to `equals()` are not required to return different `hashCode()` values, but returning different values improves the performance of hash tables.
+
+With records, which became a standard feature in Java 16, you no longer have to write these two methods yourself. link:https://openjdk.org/jeps/395[JEP 395], which introduced records, states that a record's `equals()` and `hashCode()` are generated automatically based on the values of all its components. Two record instances are equal when they have the same type and all of their component values are equal.
+
+[source,java]
+----
+public record Money(BigDecimal amount, Currency currency) {
+}
+----
+
+Two instances of this class are equal when the values they hold are the same.
+
+[source,java]
+----
+Currency krw = Currency.getInstance("KRW");
+Money price1 = new Money(BigDecimal.valueOf(10000), krw);
+Money price2 = new Money(BigDecimal.valueOf(10000), krw);
+
+assertThat(price1).isEqualTo(price2); // equal when the values match, even with different references
+----
+
+However, because a record uses the `equals()` of each component type as is, the automatically generated equality may differ from the equality the domain wants. For example, `BigDecimal`'s `equals()` compares the scale as well, so `Money` instances created from `new BigDecimal("10000")` and `new BigDecimal("10000.0")` end up as different values. In such cases, normalize the values in the constructor or define `equals()` yourself.
+
+The concept of an identity-free value object is also being introduced into the Java language and the JVM. It shares with the Value Object of DDD and Fowler the trait of being distinguished by value, without identity. Project Valhalla's link:https://openjdk.org/jeps/401[JEP 401: Value Objects (Preview)] proposes value objects that are immutable, have no object identity, and are distinguished only by their field values. As of August 2026, this JEP has been integrated as a preview feature into JDK 28, scheduled for release in March 2027. link:https://openjdk.org/jeps/169[JEP 169: Larval State for Value Objects] is a separate Draft proposal that deals with a temporary mutable state for these immutable value objects. That said, identity in DDD is a question of whether something needs to be conceptually distinguished in the domain, while the identity that Valhalla removes is a runtime property by which the JVM tells objects apart, so the two value objects are not the same concept. Even so, neither side uses value object to mean an object with nothing but getters and setters.
+
+Meanwhile, in practice, a convention has also spread that interprets VO in the broad sense of a data holder, independent of the definition above, and calls carrier objects with nothing but getters and setters VOs. The main source that spread this convention is examined in the Core J2EE Patterns section below.
+
+=== The Status of Immutability: Definitional Requirement vs. Good Design
+
+Many books and articles recommend making Value Objects completely immutable.
+
+* On p. 486 of **Patterns of Enterprise Application Architecture**, Fowler recommends making Value Objects immutable, saying "it's a very good idea to make them immutable".
+* Fowler's Value Object article says the same. The link:https://web.archive.org/web/20110104080034/http://martinfowler.com/bliki/ValueObject.html[version before the 2016 revision] presented making value objects entirely immutable as a general heuristic, and the current revised version also presents "value objects should be immutable" as an important rule.
++
+____
+A general heuristic is that value objects should be entirely immutable.
+____
+* In the Value Objects entry of the DDD Reference quoted above, Eric Evans gives the design guideline to treat value objects as immutable.
++
+____
+Treat the value object as immutable. Make all operations Side-effect-free Functions that don't depend on any mutable state. Don't give a value object any identity and avoid the design complexities necessary to maintain entities.
+____
+* In Item 17 "Minimize mutability" of **Effective Java**, 3rd ed., Joshua Bloch recommends, for classes in general and not just Value Objects, minimizing mutability and making them immutable where possible.
+
+If a VO is immutable, no aliasing bug arises even when several objects share the same instance. An aliasing bug is the problem where changing a value on one side also changes the value on another side that references the same instance. Java's `java.util.Date` and `Calendar` are objects with the nature of values, yet they were designed to be mutable and became a source of such bugs. For example, when two objects share a single `Date` instance holding a meeting's start time, calling `setTime()` on one side changes the start time on the other side as well.
+
+[source,java]
+.Side effect of the mutable Date class
+----
+record Meeting(String title, Date start) {
+}
+
+Date start = new Date();
+Meeting review = new Meeting("Design review", start);
+Meeting retro = new Meeting("Retrospective", start);
+
+long oneHourLater = start.getTime() + Duration.ofHours(1).toMillis();
+review.start().setTime(oneHourLater); // <1>
+
+assertThat(retro.start().getTime()).isEqualTo(oneHourLater); // <2>
+----
+<1> Tries to postpone only the design review by one hour
+<2> The retrospective's start time changes too
+
+Declaring `Meeting` as a record is not enough on its own to prevent this problem. A record only prevents assigning a different instance to a field; the internal state of the `Date` that the field references can still be changed.
+
+The fact that Java 8's `java.time` package made all of its date and time classes, such as `LocalDate` and `Instant`, immutable also reflects this lesson. If the start time is represented as a `LocalDateTime`, a date and time without a time zone, `plusHours()` returns a new instance instead of modifying the existing one, so sharing the instance does not change the start time of the other meeting.
+
+[source,java]
+----
+record Meeting(String title, LocalDateTime start) {
+}
+
+LocalDateTime start = LocalDateTime.of(2026, 9, 25, 14, 0);
+Meeting review = new Meeting("Design review", start);
+Meeting retro = new Meeting("Retrospective", start);
+
+Meeting delayedReview = new Meeting(review.title(), review.start().plusHours(1));
+
+assertThat(delayedReview.start()).isEqualTo(LocalDateTime.of(2026, 9, 25, 15, 0));
+assertThat(retro.start()).isEqualTo(start); // <1>
+----
+<1> The retrospective's start time is unchanged
+
+A close look at Fowler's and Evans's sentences, however, shows that immutability appears as a guideline, not as the definition of a VO. Fowler presents immutability as a rule for avoiding aliasing bugs, and Evans presents it as an imperative design guideline. The property Fowler presents as the definition of a Value Object is equality by value. The "value objects should be immutable" quoted above also appears, when you read the whole sentence, as a rule he follows in order to avoid aliasing bugs.
+
+[quote, Martin Fowler, Value Object]
+____
+To avoid aliasing bugs I follow a simple but important rule: value objects should be immutable.
+____
+
+In the same article, he even mentions an alternative: aliasing bugs can also be avoided when the language copies the value on every assignment, as with structs in C#.
+
+[quote, Martin Fowler, Value Object]
+____
+While immutability is my favorite technique to avoid aliasing bugs, it's also possible to avoid them by ensuring assignments always make a copy. Some languages provide this ability, such as structs in C#.
+____
+
+Evans wrote about immutability in imperative sentences. In the solution part of the DDD Reference quoted above, the criterion for classifying something as a value object is whether you care only about the attributes and logic of the model element. The "Treat the value object as immutable." that follows is an imperative sentence telling you to treat the objects so classified as immutable, and the sentence right after it is also an imperative, telling you to make all operations side-effect-free functions. I read these sentences not as classification criteria but as design guidance for handling the objects once they have been classified.
+
+The comments Fowler left on the link:https://wiki.c2.com/?ValueObjectsShouldBeImmutable[ValueObjectsShouldBeImmutable] page of Ward Cunningham's wiki show the distinction between definition and guideline even more clearly. He says not to give a newly designed object any methods that change its state.
+
+[quote, Martin Fowler, c2 wiki: ValueObjectsShouldBeImmutable]
+____
+So if you design an object that should be a value object, don't provide any methods that change its state, ie make it immutable.
+____
+
+And about Value Objects that have already been made mutable, he says the following.
+
+[quote, Martin Fowler, c2 wiki: ValueObjectsShouldBeImmutable]
+____
+If you are using a ValueObject that is mutable, treat it like it is immutable. You may not realize why, but you will save a lot of time and money.
+____
+
+The very premise "If you are using a ValueObject that is mutable" presupposes the existence of Value Objects that are not immutable. The page is also named ShouldBeImmutable, not MustBeImmutable. The link:https://dictionary.cambridge.org/dictionary/english/should[Cambridge Dictionary] gives the first meaning of should as follows.
+
+[quote, Cambridge Dictionary, should]
+____
+used to say or ask what is the correct or best thing to do
+____
+
+The same dictionary explains link:https://dictionary.cambridge.org/dictionary/english/must[must] as used to show that it is necessary or very important that something happens. If must expresses a necessity that something has to be so, should expresses a recommendation that doing so is the right thing.
+
+On the other hand, some sources do describe immutability as part of the definition.
+
+* Microsoft's .NET architecture documentation mentioned above lists the absence of identity and immutability side by side as the two main characteristics of value objects, and states that immutability is an important requirement.
++
+____
+There are two main characteristics for value objects: They have no identity. They are immutable. The first characteristic was already discussed. Immutability is an important requirement.
+____
+* Wikipedia writes that value objects should be immutable, and explains that immutability is required for the implicit contract that two value objects created with the same values must remain equal. Although it uses should, it treats immutability as the premise of a contract, which gives it a status close to that of a definition.
+* Chapter 6 of Vaughn Vernon's **Implementing Domain-Driven Design** (2013) also includes immutability as one of the characteristics it lists for Value Objects.
+* Kim Woo-geun's **Pragmatic Programming for Java/Spring Developers** (2024, in Korean) also explains that "A VO is an object that has this property of immutability" (p. 43), and defines a VO as an object that satisfies three characteristics: immutability, equality, and self-validation.
+* There are also concepts like the value object of JEP 401, where fields implicitly become final and shallow immutability is enforced at the language level. A different instance cannot be assigned to a field, but the internal state of the object a field references does not thereby become immutable.
+
+I see immutability as a desirable design norm rather than a definitional requirement of a VO. On the c2 wiki, Fowler too wrote that newly designed objects should be made immutable. Since a new Value Object is designed to be immutable whichever view you follow, cases where the difference between should and must shows up in practice are not common. Still, the distinction is not meaningless. When you meet a value-like object that was built mutable, like `java.util.Date`, including immutability in the definition makes that object something other than a VO, while treating immutability as a guideline makes it a VO that fails to follow the immutability guideline. Fowler's sentence on the c2 wiki is practical advice from the latter viewpoint. It means that if you have already run into a VO that fails the immutability guideline, you should at least treat it as if it were immutable instead of excluding it as not a VO.
+
+It is similar to the difference between including 'not driving after drinking' in the definition of a driver and seeing it as a norm a driver must follow. Either way, the conclusion that you must not drive after drinking is the same, but if the norm is folded into the definition, there is no longer a name for the violations that exist in reality, which makes such cases hard to discuss.
+
+
+== Definition of DTO (Data Transfer Object)
+
+In Fowler's original definition, a DTO is an object meant to reduce the cost of remote calls. link:https://martinfowler.com/eaaCatalog/dataTransferObject.html[The catalog for Martin Fowler's **Patterns of Enterprise Application Architecture**] defines a DTO as follows.
+
+[quote, Martin Fowler, Patterns of Enterprise Application Architecture catalog: Data Transfer Object]
+____
+An object that carries data between processes in order to reduce the number of method calls.
+____
+
+The same definition appears on page 401 of the book. Every remote call costs a network round trip and serialization, so the pattern grew out of the intent to deliver all the needed data in a single call. For example, instead of fetching a customer's name, address, and order list with three remote getter calls, you receive a single DTO holding all three values in one call.
+
+Objects that hold data crossing the network, such as HTTP API requests and responses, fit this definition in that they cross a process boundary and are serialized. Not every HTTP API is designed to reduce the number of remote calls, however, so calling these objects DTOs extends the original definition to modern API boundaries.
+
+In practice the definition has been stretched further. A convention has emerged of calling any object that carries data across layer boundaries within the same process a DTO, with no remote call involved. Examples include objects holding DB query results, objects passed from the service layer to the view rendering layer, and response-only objects converted from JPA entities so that the entities are not exposed directly outside the service layer. This usage is far from the original definition of reducing the number of remote calls, so one could argue that such objects are hard to call DTOs.
+
+Apart from the debate over the name, one can also ask whether having such objects in a local context is desirable from a design standpoint. In link:https://martinfowler.com/bliki/LocalDTO.html[LocalDTO], Fowler takes issue not with the name but with this usage. His starting point is that the DTO pattern exists to reduce the cost of remote calls, so in a local context with no remote calls that reason disappears. He therefore says that in a local context DTOs are not just unnecessary but actually harmful. The reasons are that a coarse-grained API that exchanges a lot of data in a single call is awkward to use, and that all the work of moving data from the domain layer or data source layer into DTOs is added cost.
+
+[quote, Martin Fowler, LocalDTO]
+____
+Not just do you not need them in a local context, they are actually harmful both because a coarse-grained API is more difficult to use and because you have to do all the work moving data from your domain or data source layer into the DTOs.
+____
+
+To the argument that DTOs should be placed in the service layer API so that the service layer's clients do not depend on the domain model, he replies that this may be convenient but is not worth all the cost of the data mapping.
+
+In the same article, however, he acknowledges that something like a DTO is useful even locally when there is a large gap between the presentation layer's model and the domain model.
+
+[quote, Martin Fowler, LocalDTO]
+____
+One case where it is useful to use something like a DTO is when you have a significant mismatch between the model in your presentation layer and the underlying domain model.
+____
+
+In such cases the mapping between the two models is needed anyway, so the DTO is not an added cost. Later in the same article he also adds the use of DTOs for exchanging data as messages between isolated areas in a multithreaded application. In short, Fowler's criticism is aimed at DTOs introduced for the sake of separation from the domain model itself. It does not reject cases where there is a real need, such as a mismatch between models or message passing between isolated areas.
+
+The naming debate and the usage debate are different questions, but they start from the same premise. The fact that a local context has no remote calls serves, on one side, as grounds that the name DTO does not match the original definition, and on the other, as grounds that the reason to have a DTO grows weak. The role-based suffixes I propose later are an answer to the naming debate. Whether to have such an object at all is a matter to settle separately in the usage debate, and if you decide to have one, the proposal is to give it a name that reveals its role rather than `Dto`.
+
+In the end, the criterion for distinguishing a VO from a DTO is the object's characteristics and role. Representing a value concept and judging equality by value is a property of a VO; carrying data across a boundary is the role of a DTO. The two are not mutually exclusive categories. An immutable DTO with value equality is also a VO. Conversely, not every DTO needs value equality.
+
+== VO in the First Edition of Core J2EE Patterns and TO in the Second
+
+In the Java/J2EE (now Jakarta EE) community, a prominent early source that spread the conflation of the two terms is **Core J2EE Patterns: Best Practices and Design Strategies** by Deepak Alur and others. The first edition, published in 2001, defined an object that transfers data between tiers as a pattern named Value Object. The second edition in 2003 renamed the same pattern TO (Transfer Object). The rename appears intended to avoid confusion with the Value Object as a value-equality object. Martin Fowler calls the pattern with the same role a DTO (**Patterns of Enterprise Application Architecture**, p. 401). In short, the following three refer to the same transfer pattern.
+
+____
+VO in Core J2EE Patterns 1st ed. = TO in the 2nd ed. = Martin Fowler's DTO
+____
+
+link:https://www.oracle.com/java/technologies/transfer-object.html[Oracle's Transfer Object documentation] describes this pattern under the renamed name, Transfer Object.
+
+Several other books also wrote that VO and DTO mean the same thing or are very close concepts.
+
+* Rod Johnson, **Expert One-on-One J2EE Design and Development**, Wrox, 2002, p. 265
++
+____
+Value objects are sometimes referred to as Data Transfer Objects (DTOs).
+____
+* Rod Johnson and Juergen Hoeller, **Expert One-on-One J2EE Development without EJB**, Wrox, 2004, p. 27
++
+____
+Transfer objects, often referred to as Data Transfer Objects (DTOs) or Value Objects.
+____
+* Murat Yener and Alex Theedom, **Professional Java EE Design Patterns**, Wrox, 2014, Chapter 12
++
+____
+The DTO is also referred to as the Value Object
+____
+* Derek C. Ashmore, **The Java EE Architect's Handbook, Second Edition**, DVT Press, 2014, Chapter 5
++
+____
+My definition of 'value object' is very close to a Data Transfer Object (DTO)
+____
+
+I cannot say for certain that all of these books were directly influenced by the first edition of Core J2EE Patterns. But given when they appeared and the phrasing repeated across the literature, I suspect the first edition's usage had some influence on the wording of later Java/J2EE literature. More than twenty years after the second edition changed the name, the practice remains.
+
+== The Cost of Calling a Data Carrier a VO
+
+You might wonder whether a name already in common use within a team really needs to change. But the practice of calling data carrier objects VOs has a real cost, because the Value Object as a value-equality object keeps appearing in three contexts: DDD, ORM, and Java language and JVM features.
+
+* DDD (Domain-Driven Design): the VALUE OBJECT is, along with the ENTITY, a core building block of the domain model. An AGGREGATE is a consistency boundary for data changes with a single ENTITY as its root, and it can contain other ENTITIES and VALUE OBJECTS inside it.
+* ORM: `@Embeddable` in Hibernate and JPA maps an object that has no persistent identity of its own and belongs to the entity that owns it. It is the structure commonly used to map DDD VALUE OBJECTS, but JPA does not enforce value equality or immutability, so not every `@Embeddable` is a DDD VALUE OBJECT.
+* Java language and JVM features: the Project Valhalla documents, including JEP 401, use the term value object to mean an object that is immutable, has no object identity, and is distinguished by its field values.
+
+If you understand a VO as a data holder with nothing but getters and setters, the terminology clashes when you read these materials, and confusion follows. For example, reading an explanation that says to map a VO as an `@Embeddable`, you picture a request parameter object full of setters. Calling a data carrier object that crosses a remote process boundary a DTO connects naturally both with Fowler's definition and with the renamed name used since the second edition of Core J2EE Patterns.
+
+As seen in the DTO definition section above, recent convention also uses DTO in the broad sense of a data holder that crosses a layer boundary. But attaching the DTO suffix to every carrier object has a drawback. If objects holding HTTP request parameters and objects holding the results of statistics queries are all called DTOs, the name alone does not reveal the role. For example, from the name `IssueDto` alone you cannot tell whether it is a request body, a lookup response, or the result of a statistics query.
+
+I recommend dividing suffixes by the object's role. The name then reveals the role on its own, and you also avoid the debate over departing from the strict definition when objects used in layers unrelated to remote calls are called DTOs. Here are some example names.
+
+[cols="2,2", options="header"]
+|===
+|Role |Example class names
+
+|JSON response for an issue lookup
+|`IssueResponse`, `IssueDetailDto`
+
+|JSON request for issue creation
+|`IssueCreationRequest`, `IssueCreationCommand`
+
+|Issue lookup criteria
+|`IssueQuery`, `IssueCriteria`
+
+|Result of an issue statistics query against the DB
+|`IssueStatsRow`
+|===
+
+== References
+
+=== Value Object
+
+* https://martinfowler.com/bliki/ValueObject.html[Martin Fowler: Value Object]
+* https://web.archive.org/web/20110104080034/http://martinfowler.com/bliki/ValueObject.html[Martin Fowler: Value Object (version before the 2016 revision, Wayback Machine)]
+* https://wiki.c2.com/?ValueObjectsShouldBeImmutable[C2 Wiki: Value Objects Should Be Immutable]
+* https://en.wikipedia.org/wiki/Value_object[Wikipedia: Value object]
+* https://learn.microsoft.com/en-us/dotnet/architecture/microservices/microservice-ddd-cqrs-patterns/implement-value-objects[Microsoft: Implement value objects]
+* Martin Fowler, link:https://www.informit.com/store/patterns-of-enterprise-application-architecture-9780321127426[**Patterns of Enterprise Application Architecture**], Addison-Wesley, 2002, p. 486
+* Eric Evans, link:https://www.informit.com/store/domain-driven-design-tackling-complexity-in-the-heart-9780321125217[**Domain-Driven Design**], Addison-Wesley, 2003
+* https://www.domainlanguage.com/wp-content/uploads/2016/05/DDD_Reference_2015-03.pdf[Eric Evans: Domain-Driven Design Reference (2015), Value Objects]
+* Kim Woo-geun, link:https://wikibook.co.kr/pragmatic-programming/[**Pragmatic Programming for Java/Spring Developers** (in Korean)], WikiBooks, 2024, p. 43
+* Joshua Bloch, link:https://www.informit.com/store/effective-java-9780134685991[**Effective Java**] 3rd ed., Addison-Wesley, 2018, Items 10, 11, and 17
+* Vaughn Vernon, link:https://www.informit.com/store/implementing-domain-driven-design-9780133039894[**Implementing Domain-Driven Design**], Addison-Wesley, 2013, Chapter 6
+* https://c2.com/ppr/checks.html[Ward Cunningham: The CHECKS Pattern Language of Information Integrity - Whole Value]
+* https://openjdk.org/jeps/395[JEP 395: Records]
+* https://openjdk.org/jeps/401[JEP 401: Value Objects (Preview)]
+* https://openjdk.org/jeps/169[JEP 169: Larval State for Value Objects]
+
+=== Transfer Object / DTO
+
+* https://martinfowler.com/eaaCatalog/dataTransferObject.html[Martin Fowler: Data Transfer Object]
+* https://martinfowler.com/bliki/LocalDTO.html[Martin Fowler: LocalDTO]
+* Martin Fowler, link:https://www.informit.com/store/patterns-of-enterprise-application-architecture-9780321127426[**Patterns of Enterprise Application Architecture**], Addison-Wesley, 2002, p. 401
+* Deepak Alur, John Crupi, and Dan Malks, link:https://www.amazon.com/Core-J2EE-Patterns-Practices-Strategies/dp/0130648841[**Core J2EE Patterns: Best Practices and Design Strategies**] 1st ed., Prentice Hall, 2001
+* Rod Johnson, link:https://www.wiley.com/en-us/Expert+One+on+One+J2EE+Design+and+Development-p-9780764543852[**Expert One-on-One J2EE Design and Development**], Wrox, 2002, p. 265
+* Rod Johnson and Juergen Hoeller, link:https://www.wiley.com/en-us/Expert+One+on+One+J2EE+Development+without+EJB-p-9780764573903[**Expert One-on-One J2EE Development without EJB**], Wrox, 2004, p. 27
+* Murat Yener and Alex Theedom, link:https://www.wiley.com/en-us/Professional+Java+EE+Design+Patterns-p-9781118843413[**Professional Java EE Design Patterns**], Wrox, 2014, Chapter 12
+* Derek C. Ashmore, link:https://www.amazon.com/Java-Architects-Handbook-Second-applications/dp/0972954880[**The Java EE Architect's Handbook, Second Edition**], DVT Press, 2014, Chapter 5
+* https://www.oracle.com/java/technologies/transfer-object.html[Oracle: Core J2EE Patterns - Transfer Object]
+* http://www.adam-bien.com/roller/abien/entry/value_object_vs_data_transfer[Adam Bien: Value Object vs. Data Transfer Object (VO vs. DTO)]
+
+=== Related Talk
+
+* https://github.com/benelog/presentations/blob/main/20200507-entity-design/slides.md[Entity class design and persistence frameworks (talk, 2020, in Korean)]
+
+=== Korean Original
+
+* https://blog.benelog.net/vo-vs-dto.html[VO vs DTO: 정의와 용어 혼용의 역사 (Korean original of this article)]
+
+'''
+
+This post was translated from the Korean original by Sanghyuk Jung with help from Claude Code.
