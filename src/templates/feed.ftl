@@ -3,7 +3,7 @@
   <channel>
     <title>${config.site_title}</title>
     <link>${config.site_host}</link>
-    <atom:link href="${config.site_host}/${config.feed_file}" rel="self" type="application/rss+xml" />
+    <atom:link href="${config.site_host}${config.feed_file}" rel="self" type="application/rss+xml" />
     <description>${config.sidebar_intro_summary}</description>
     <language>en</language>
     <pubDate>${published_date?string("EEE, d MMM yyyy HH:mm:ss Z")}</pubDate>
@@ -12,7 +12,7 @@
     <#list published_posts as post>
     <item>
       <title><#escape x as x?xml>${post.title}</#escape></title>
-      <link>${config.site_host}/${post.noExtensionUri!post.uri}</link>
+      <link>${config.site_host}${post.noExtensionUri!post.uri}</link>
       <pubDate>${post.date?string("EEE, d MMM yyyy HH:mm:ss Z")}</pubDate>
       <guid isPermaLink="false">${post.noExtensionUri!post.uri}</guid>
       	<description>
