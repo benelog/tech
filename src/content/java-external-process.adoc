@@ -1,0 +1,1078 @@
+= Running External Processes from Java: JDK 25 on Linux 6.x
+Sanghyuk Jung
+2026-10-03
+:jbake-type: post
+:jbake-status: published
+:jbake-tags: java, jdk, linux
+:description: What to get right when launching external processes from Java on JDK 25 and Linux 6.x: draining stdout and stderr, closing stdin, timeouts, termination policy, and cleaning up descendants with process groups or cgroups. Compares zt-exec and Apache Commons Exec, and explains the default posix_spawn launch mechanism, the cost of FORK on large heaps, and the removal of VFORK.
+:idprefix:
+:toc:
+:toclevels: 3
+:examples-repo: https://github.com/benelog/blog/tree/main/examples
+:source-repo: {examples-repo}/java-external-process
+
+This article, based on JDK 25 and Linux 6.x, covers what to watch for when writing Java code that launches external processes, and the libraries you can use for it.
+It then looks at how the JVM creates child processes on Linux: the `posix_spawn()` function, the behavior of `jspawnhelper`, a small executable shipped with the JDK, the launch latency that appears with large heaps, and the setting that changes the launch mechanism.
+The results in this article were verified in the environment below. The example code is in the link:{source-repo}[GitHub repository].
+
+[cols="1,2", options="header"]
+|===
+|Item |Value
+
+|OS
+|Ubuntu 24.04.4 LTS, kernel 6.17
+
+|Architecture
+|x86-64
+
+|glibc
+|2.39
+
+|JDK
+|Temurin 25+36
+
+|zt-exec
+|1.13.0
+
+|Apache Commons Exec
+|1.6.0
+|===
+
+== Pitfalls of Launching External Processes with the JDK Classes
+
+=== `ProcessBuilder` vs. `Runtime.exec`
+
+An external process launched from Java code is handled through a `java.lang.Process` object. You get a `Process` object from `ProcessBuilder.start()` or `Runtime.exec()`. `ProcessBuilder` was https://docs.oracle.com/javase/1.5.0/docs/guide/lang/enhancements.html[added in JDK 5.0 (Java 1.5)], and from that release the Sun JDK's `Runtime.exec()` was also changed to delegate internally to `ProcessBuilder`. https://www.javainthebox.net/laboratory/J2SE1.5/TinyTips/ProcessBuilder/ProcessBuilder.html[A contemporary write-up that examined the JDK 1.5.0-beta2 source] shows this implementation as well. The https://github.com/openjdk/jdk/blob/jdk-25%2B36/src/java.base/share/classes/java/lang/Runtime.java[Runtime source] in OpenJDK 25 likewise creates a `ProcessBuilder` and calls `start()`. The two APIs therefore share the process creation implementation; the main difference is how they handle the launch configuration.
+
+**I recommend `ProcessBuilder` for new code.** It offers a more convenient API for specifying environment variables, the working directory, and output redirection. The output pipe handling discussed in this article can also be configured with `redirectOutput()`, `redirectError()`, `redirectErrorStream()`, and similar methods.
+
+[cols="1,2,2", options="header"]
+|===
+|Item |Runtime.exec() |ProcessBuilder
+
+|When it runs
+|Runs when `exec()` is called
+|Runs on `start()` after the configuration is set up
+
+|Command and arguments
+|A single string or an array of strings
+|Varargs or a list with the arguments already separated
+
+|Environment variables
+|Passed as an array of `NAME=value` strings
+|Modified through the Map returned by `environment()`
+
+|Working directory
+|Passed as an argument to an overload
+|Set with `directory()`
+
+|I/O configuration
+|No API for redirection or for merging standard error
+|Provides `redirectOutput()`, `redirectError()`, `redirectErrorStream()`, `inheritIO()`, and more
+|===
+
+In particular, the `Runtime.exec(String)` family, which takes the command as a single string, has been deprecated since JDK 18. The https://docs.oracle.com/en/java/javase/25/docs/api/java.base/java/lang/Runtime.html[Runtime Javadoc] explains that these methods split arguments on whitespace alone, so they can mishandle things like file names that contain spaces. Adding quotes does not group arguments the way a shell would.
+
+[source,java]
+----
+// Cannot pass a file name with a space as a single argument
+Runtime.getRuntime().exec("cat \"my file.txt\"");
+
+// Both forms pass the file name as a single argument
+Runtime.getRuntime().exec(new String[]{"cat", "my file.txt"});
+new ProcessBuilder("cat", "my file.txt").start();
+----
+
+=== Limits of the `ProcessBuilder` Defaults
+
+In Java, you can launch an external process with a few simple lines of code using the `ProcessBuilder` class, as shown below.
+
+[source,java]
+.Calling `ProcessBuilder` with the defaults
+----
+Process process = new ProcessBuilder("echo", "hello").start();
+int exitCode = process.waitFor();
+System.out.println("exit=" + exitCode);
+----
+
+With `echo hello`, which produces little output and finishes quickly, this code works without problems.
+But if you run a command that produces a lot of output, waits on standard input, or never finishes, this code can hang.
+
+=== Handling the stdout and stderr Pipes
+
+**If the child process fills the limited capacity of the standard output (stdout) or standard error (stderr) pipe while the parent process is not reading, the child blocks on its next write.**
+To prevent that, you need code that keeps consuming standard output and standard error.
+You must use one of the following two approaches.
+
+* Read the standard output and standard error streams on separate threads.
+** If you need to process or refer to the two outputs separately, read each on its own thread.
+** If you do not need to tell the two outputs apart, you can merge them into one and read it on a single thread.
+* If you do not need to read a stream at all, redirect it to a file, to the parent's output, or to `/dev/null`.
+
+The earlier 'Calling `ProcessBuilder` with the defaults' code used neither of these approaches.
+The following sections reproduce how this code hangs with examples and explain how to fix it.
+
+==== Deadlock from an Unread Pipe Buffer
+
+Even with `ProcessBuilder`, the child process's standard output and standard error are delivered to the parent process through separate pipes by default. If the parent does not read a pipe, the pipe buffer fills up and the child process cannot finish writing.
+
+**This problem occurs even if you never call `waitFor()`.** The parent can go on executing the code that follows the child's launch, but the child may be unable to finish its work because its `write()` call to the full pipe blocks. If on top of that the parent just waits for the child to exit with `waitFor()`, the two end up in a deadlock, each waiting for the other. So removing `waitFor()` does not solve it; you have to read or redirect the output pipes. The `Process` Javadoc in JDK 25 warns about this blocking and the possibility of deadlock.
+
+.From the Javadoc of the `Process` class
+____
+Because some native platforms only provide limited buffer size for standard input and output streams, failure to promptly write the input stream or read the output stream of the process may cause the process to block, or even deadlock.
+____
+
+The https://man7.org/linux/man-pages/man7/pipe.7.html[pipe(7)] manual page tells how large the "limited buffer size" mentioned in the Javadoc is on Linux. Since kernel 2.6.11 the default pipe capacity has been 16 pages, that is, 64KiB with 4KiB pages. However, it can be smaller depending on the per-user pipe memory limit or system settings, and it can be changed with `F_SETPIPE_SZ`, so you should not assume 64KiB as a fixed limit.
+
+The code below has the `seq 1 100000` command print 588,895 bytes and waits 3 seconds without reading them.
+
+[source,java]
+.DeadlockDemo.java
+----
+Process process = new ProcessBuilder("seq", "1", "100000").start();
+boolean finished = process.waitFor(3, TimeUnit.SECONDS);
+System.out.println("finished within 3s: " + finished + ", alive: " + process.isAlive());
+long lines = process.inputReader().lines().count();
+int exitCode = process.waitFor();
+System.out.println("read " + lines + " lines, exit=" + exitCode + ", alive: " + process.isAlive());
+----
+
+[source,text]
+.Output of DeadlockDemo.java
+----
+finished within 3s: false, alive: true
+read 100000 lines, exit=0, alive: false
+----
+
+After the parent process has waited 3 seconds, the child process is still alive. Once the pipe buffer filled up, the `write()` call in `seq` blocked and never returned. When the parent read the pipe to the end, the child wrote the rest of its output and finished with exit code 0 (`alive: false`). Without the timeout, the parent would have kept waiting in `waitFor()` as well.
+
+The `inputReader()` method used in the example was added in JDK 17. Before that, you had to wrap `getInputStream()` in an `InputStreamReader` and a `BufferedReader`.
+
+[source,java]
+.Using `inputReader()`
+----
+// Before JDK 17
+BufferedReader reader = new BufferedReader(
+        new InputStreamReader(process.getInputStream()));
+long lines = reader.lines().count();
+
+// JDK 17 and later
+long lines = process.inputReader().lines().count();
+----
+
+The two snippets choose their default encoding differently. `inputReader()` decodes with the encoding named by the `native.encoding` system property, while an `InputStreamReader` created without arguments uses `Charset.defaultCharset()`. https://openjdk.org/jeps/400[Since JDK 18 the default charset is UTF-8], but if you specify `-Dfile.encoding=COMPAT`, the default encoding is determined by the operating system, the locale, and so on, as it was before.
+
+`inputReader()` does not detect the child process's output encoding automatically. If the child writes in the same encoding as the parent JVM's `native.encoding`, this default is appropriate. If the child explicitly writes UTF-8 or runs under a different locale, you must specify the encoding yourself to match its output, for example `inputReader(StandardCharsets.UTF_8)`.
+
+==== Reading Both Streams Concurrently
+
+If you need to receive and process standard output and standard error separately, you have to drain both pipes at the same time. Reading one pipe to the end and then reading the other is not enough. If the standard error pipe fills first, the child process cannot write any more standard output, and the parent deadlocks waiting for EOF on standard output. In this case the program hangs in the read before it even reaches `waitFor()`.
+
+The code below runs a command that writes 588,895 bytes to standard error and then one line to standard output, and it reads standard output to the end before reading standard error.
+
+[source,java]
+.SequentialReadDemo.java
+----
+Process process = new ProcessBuilder("sh", "-c", "seq 1 100000 >&2; echo done").start();
+System.out.println("reading stdout...");
+long outLines = process.inputReader().lines().count();
+long errLines = process.errorReader().lines().count();
+System.out.println("stdout " + outLines + ", stderr " + errLines + ", exit=" + process.waitFor());
+----
+
+When you run this code, nothing follows the first line no matter how long you wait, and `ps` shows that the child `seq` process is still alive.
+
+[source,text]
+.Output of SequentialReadDemo.java
+----
+reading stdout...
+----
+
+`seq` is blocked because the standard error pipe is full, and the parent is waiting for an EOF on standard output that has not yet arrived. The next line, which reads standard error, never executes, so the deadlock is never broken. Giving each stream its own reader thread avoids neglecting one stream while reading the other. The `PlainJdkRunner` example later in this article takes that approach.
+
+If you do not need to tell the two outputs apart, you can merge standard error into standard output with `redirectErrorStream(true)`. That leaves only one pipe to read, so a single thread can handle it.
+
+[source,java]
+.MergedReadDemo.java
+----
+Process process = new ProcessBuilder("sh", "-c", "seq 1 100000 >&2; echo done")
+        .redirectErrorStream(true)
+        .start();
+long lines = process.inputReader().lines().count();
+System.out.println("read " + lines + " lines, exit=" + process.waitFor());
+----
+
+It is the same command, but this time it runs to completion. The 100,001 lines are the 100,000 lines written to standard error plus the single `done` line on standard output.
+
+[source,text]
+.Output of MergedReadDemo.java
+----
+read 100001 lines, exit=0
+----
+
+==== Redirecting Output the Java Process Will Not Read
+
+If the parent process does not need to refer to or process the child's output, the simplest option is not to create a pipe that the Java code has to read. The alternatives to the default `Redirect.PIPE` are as follows.
+
+* `Redirect.INHERIT`: the child process writes directly to the parent's standard output and standard error. (Since JDK 7)
+** The `inheritIO()` method hands down all three of the parent process's streams (standard input, standard output, and standard error) at once. (Since JDK 7)
+* `Redirect.DISCARD`: sends the output to `/dev/null`. (Since JDK 9)
+* `Redirect.to(File)`: sends the output to a file. (Since JDK 7)
+
+[source,java]
+.Redirecting the child process's output
+----
+// Send directly to the parent's stdout and stderr
+new ProcessBuilder("seq", "1", "100000")
+        .redirectOutput(Redirect.INHERIT)
+        .redirectError(Redirect.INHERIT)
+        .start()
+        .waitFor();
+
+// Inherit all three streams at once, including stdin
+new ProcessBuilder("seq", "1", "100000")
+        .inheritIO()
+        .start()
+        .waitFor();
+
+// Discard the output to /dev/null
+new ProcessBuilder("seq", "1", "100000")
+        .redirectOutput(Redirect.DISCARD)
+        .redirectError(Redirect.DISCARD)
+        .start()
+        .waitFor();
+
+// Send to files
+new ProcessBuilder("seq", "1", "100000")
+        .redirectOutput(Redirect.to(new File("seq-out.log")))
+        .redirectError(Redirect.to(new File("seq-err.log")))
+        .start()
+        .waitFor();
+----
+
+In this environment, all four approaches printed the same 588,895 bytes as the earlier deadlock example and exited normally.
+Because no child output pipe is created that the parent JVM has to read itself, there is no deadlock from an unread pipe.
+However, if the output target inherited through `INHERIT` is itself a pipe, for example if the parent JVM's standard output is piped to another program, the child's writes can block or slow down depending on how fast that program reads.
+When discarding output, specify `DISCARD` for both standard output and standard error. If you specify only one, the other remains at the default `PIPE`, and the earlier deadlock can recur. `Redirect.to(File)` truncates an existing file and overwrites it, so to append on each run use `Redirect.appendTo(File)`.
+
+==== Closing stdin and EOF
+
+Standard input (stdin), which the Javadoc quoted above warned about alongside the output streams, also defaults to a pipe. As long as the parent JVM keeps the write end of that pipe open, the child process never receives EOF. A command that reads stdin to the end, such as `cat` run without arguments, keeps waiting even though no more input is coming, and the parent waits in `waitFor()` for that command to finish. Draining the output pipes does not release this wait.
+
+If you have no input to send, close the write end with `process.getOutputStream().close()` right after `start()`, or specify empty input such as `redirectInput(new File("/dev/null"))`. If you do need to send input, close the stream once you have finished writing. zt-exec and Apache Commons Exec, covered later in this article, close the child's stdin immediately when no input is specified.
+
+The example below runs `cat` four times, changing only how stdin is handled.
+
+[source,java]
+.StdinEofDemo.java
+----
+Process opened = new ProcessBuilder("cat").start();
+System.out.println("stdin left open: finished within 1s=" + opened.waitFor(1, TimeUnit.SECONDS)
+        + ", alive=" + opened.isAlive());
+opened.destroy();
+opened.waitFor();
+
+Process closed = new ProcessBuilder("cat").start();
+closed.getOutputStream().close();
+System.out.println("stdin closed: finished within 1s=" + closed.waitFor(1, TimeUnit.SECONDS)
+        + ", exit=" + closed.exitValue());
+
+Process devNull = new ProcessBuilder("cat")
+        .redirectInput(new File("/dev/null"))
+        .start();
+System.out.println("/dev/null input: finished within 1s=" + devNull.waitFor(1, TimeUnit.SECONDS)
+        + ", exit=" + devNull.exitValue());
+
+Process fed = new ProcessBuilder("cat").start();
+try (Writer writer = fed.outputWriter()) {
+    writer.write("hello\n");
+}
+String echoed = fed.inputReader().readLine();
+System.out.println("closed after writing: echoed=" + echoed + ", exit=" + fed.waitFor());
+----
+
+Here is the output. Only the first run, which left the stream writing to stdin open, failed to finish within one second; the other three received EOF and exited right away.
+
+[source,text]
+.Output of StdinEofDemo.java
+----
+stdin left open: finished within 1s=false, alive=true
+stdin closed: finished within 1s=true, exit=0
+/dev/null input: finished within 1s=true, exit=0
+closed after writing: echoed=hello, exit=0
+----
+
+The first `cat` was ended with `destroy()`. Without that cleanup it would stay alive while the remaining examples run.
+Once the parent JVM exits, however, the write end of the pipe is closed with it, so at that point `cat` also receives EOF and exits.
+
+The `outputWriter()` used in the last example was added in JDK 17 together with `inputReader()`, and it replaces the code that wraps `getOutputStream()` in an `OutputStreamWriter` and a `BufferedWriter`.
+Called without arguments it uses the charset from the `native.encoding` system property, and the `outputWriter(Charset)` method lets you specify one directly.
+
+[source,java]
+.Using `outputWriter()`
+----
+// Before JDK 17
+try (BufferedWriter writer = new BufferedWriter(
+        new OutputStreamWriter(process.getOutputStream()))) {
+    writer.write("hello\n");
+}
+
+// JDK 17 and later
+try (BufferedWriter writer = process.outputWriter()) {
+    writer.write("hello\n");
+}
+----
+
+=== Timeouts and Termination Policy
+
+Even when you handle all three pipes connected to the child process as described so far, an external command can still hang while waiting on the network or on a lock.
+That is why a timeout and a termination policy are needed as well.
+While the command hangs, the thread that called `waitFor()` blocks until the external command finishes. The `waitFor(long, TimeUnit)` method, available since JDK 8, merely returns `false` when the time runs out; it does not terminate the process.
+At that point you can request graceful termination with `destroy()` and fall back to `destroyForcibly()` if the process is still alive after a grace period, or you can kill it right away as the example below does.
+In the OpenJDK implementation on Linux, `destroy()` sends SIGTERM and `destroyForcibly()` sends SIGKILL.
+A process can catch SIGTERM with a handler and finish up before exiting: deleting temporary files, releasing locks, or cleaning up the child processes it created.
+SIGKILL terminates the process with no chance to clean up through a handler, so files and descendant processes that were never cleaned up may be left behind. For commands that have something to clean up, it is therefore safer to send SIGTERM first with `destroy()` and allow a grace period.
+Note, however, that the process may still be alive briefly after `destroyForcibly()` returns, so if you need the termination to be complete, confirm it with `waitFor()`.
+The example below only runs commands with nothing to clean up, such as `sleep`, so it kills them right away.
+It reads the two output streams on JDK 21 virtual threads and puts a one-second limit on waiting for exit.
+
+[source,java]
+.PlainJdkRunner.java
+----
+static void run(String... command) throws IOException, InterruptedException, TimeoutException {
+    Process process = new ProcessBuilder(command).start();
+    StringBuilder stdout = new StringBuilder();
+    StringBuilder stderr = new StringBuilder();
+    Thread outPump = Thread.ofVirtual().start(() -> process.inputReader().lines().forEach(l -> stdout.append(l).append('\n')));
+    Thread errPump = Thread.ofVirtual().start(() -> process.errorReader().lines().forEach(l -> stderr.append(l).append('\n')));
+    if (!process.waitFor(1, TimeUnit.SECONDS)) {
+        process.destroyForcibly().waitFor();
+        throw new TimeoutException("timed out: " + String.join(" ", command));
+    }
+    outPump.join();
+    errPump.join();
+    System.out.println(command[0] + ": exit=" + process.exitValue()
+            + ", stdout chars=" + stdout.length() + ", stderr=" + stderr.toString().trim());
+}
+----
+
+Here is the result of running four commands, `echo hello`, `seq 1 100000`, `ls /no-such-dir`, and `sleep 60`, through this method. The 588,895 bytes of output from `seq` do not cause a hang, the stderr of `ls` is collected separately, and `sleep`, which exceeds one second, ends with an exception.
+
+[source,text]
+.Output of PlainJdkRunner.java
+----
+echo: exit=0, stdout chars=6, stderr=
+seq: exit=0, stdout chars=588895, stderr=
+ls: exit=2, stdout chars=0, stderr=ls: cannot access '/no-such-dir': No such file or directory
+timed out: sleep 60
+----
+
+This example targets commands that require no input and create no descendant processes.
+To use it safely with other commands, you need to take care of the following as well.
+
+* For commands that read stdin, add the EOF handling from the previous section.
+* Propagate exceptions thrown in the reader threads to the calling thread, and clean up the process and streams on interrupt or timeout as well.
+* The one-second limit in the code above applies only to `waitFor()`. If you need an overall timeout that also covers `start()`, the subsequent wait for termination, and `join()`, implement it separately.
+* If the output is very large, do not collect all of it in a `StringBuilder`; process it line by line or with a fixed-size buffer.
+* For commands whose output encoding differs from the parent JVM's `native.encoding`, specify the encoding with `inputReader(Charset)`.
+
+=== Cleaning Up Descendant Processes
+
+`destroy()` and `destroyForcibly()` send a signal only to the child you created directly.
+If the command you ran created child processes of its own, those descendants can be left behind.
+When the child exits first, the descendant processes it created are reparented to PID 1 or to the nearest subreaper process and keep running.
+A subreaper is a process designated with `prctl(PR_SET_CHILD_SUBREAPER)`; it takes over orphaned descendants in place of PID 1. systemd is the program that, on most Linux distributions, runs first as PID 1 at boot and starts and manages the other services, and it also runs a separate instance called `systemd --user` for each logged-in user. The `systemd --user` of a desktop session is one example of a subreaper.
+
+==== Cases Where Descendants Are Left Behind
+
+There are broadly four situations in which descendant processes are left behind.
+
+* **Commands run through a shell**: this is the case when something like `sh -c "a | b"` or a script such as `run.sh` is terminated on timeout. The non-interactive shell running the script does not forward the SIGTERM it received to its children, so only the shell exits.
+* **Programs run through a wrapper or launcher**: with `npm run`, npm, which runs on Node.js, executes the script via `sh -c`, so ending the npm process can leave the command the shell started running. LibreOffice's `soffice` goes through `oosplash` to run `soffice.bin`, which does the actual work, and if you end `oosplash` with SIGKILL, `soffice.bin` is not terminated and stays behind. `git` also runs `ssh` or `git-remote-https` as a child during fetch or clone.
+* **Programs that turn themselves into daemons**: the Gradle daemon, the Kotlin compile daemon, `adb start-server`, and `ssh` ControlPersist connections are designed to outlive their caller. Such programs may also leave the original session and group with `setsid()`.
+* **Scripts that do not wait for background jobs**: if `server &` is not followed by `wait`, `server` keeps running even after the script exits normally. If this descendant keeps the inherited output pipe open, `waitFor()` returns but the reader of the output never receives EOF.
+
+Let's reproduce the first case. The code below runs `sleep 60` through a shell, calls `destroy()` after 0.3 seconds, and then prints which of the descendants it looked up before termination are still alive, along with their parent PIDs.
+
+[source,java]
+.DescendantLeakDemo.java
+----
+public static void main(String[] args) throws Exception {
+    run("sh", "-c", "sleep 60");
+    run("sh", "-c", "sleep 60; echo done");
+    run("sh", "-c", "sleep 60 | cat");
+    run("bash", "-c", "sleep 60");
+}
+
+static void run(String... command) throws Exception {
+    Process process = new ProcessBuilder(command).start();
+    Thread.sleep(300);
+    List<ProcessHandle> descendants = process.descendants().toList();
+    process.destroy();
+    process.waitFor(1, TimeUnit.SECONDS);
+    Thread.sleep(100);
+
+    List<String> left = descendants.stream()
+            .filter(ProcessHandle::isAlive)
+            .map(p -> name(p) + "(ppid=" + p.parent().map(ProcessHandle::pid).orElse(-1L) + ")")
+            .toList();
+    System.out.println(String.join(" ", command) + " -> shell alive=" + process.isAlive()
+            + ", children=" + descendants.size() + ", left=" + left);
+    descendants.forEach(ProcessHandle::destroyForcibly);
+}
+----
+
+[source,text]
+.Output of DescendantLeakDemo.java
+----
+sh -c sleep 60 -> shell alive=false, children=1, left=[sleep(ppid=1693)]
+sh -c sleep 60; echo done -> shell alive=false, children=1, left=[sleep(ppid=1693)]
+sh -c sleep 60 | cat -> shell alive=false, children=2, left=[sleep(ppid=1693), cat(ppid=1693)]
+bash -c sleep 60 -> shell alive=false, children=0, left=[]
+----
+
+In all three cases run with `sh -c`, the shell exited but `sleep` and `cat` remained. PID 1693, the parent of the leftover processes, is the `systemd --user` of this environment.
+Note that a descendant was left behind even with `sh -c "sleep 60"`, which has only a single command. dash 0.5.12, the `/bin/sh` on Ubuntu 24.04, ran even the last command received through `-c` as a child process. `bash -c`, on the other hand, replaced the shell process with `sleep` (`children=0`), so no descendants were left.
+Because this behavior varies with the kind and version of the shell, it is safer to assume that commands run through a shell leave descendants behind and to have a cleanup method ready.
+
+If the leftover descendant is a command that will finish soon, the problem lasts only as long as that descendant runs. Even so, a task you have already marked as failed on timeout may keep writing files or calling external APIs in the background during that time.
+The bigger problem is descendants that never finish on their own. The timeout itself means the command did not finish in time, so there is little reason to expect the leftover descendants to finish soon either. Descendants that are not meant to finish, such as servers or daemons, accumulate with each run and consume memory and the process count limit. If they hold on to a port or a file lock, the next run fails with an error like `Address already in use`.
+
+If a leftover descendant keeps the inherited output pipe open, a read in progress waits for the descendant to close the pipe, which can delay `join()` as well. The `Process` implementation in JDK 25 reclaims the output remaining in the pipe and closes the stream when the direct child exits, but whether a wait occurs depends on the ordering between a read already in progress and this exit handling.
+As in the example above, you can also look up descendants with `ProcessHandle.descendants()` from JDK 9 and terminate them one by one. But the result is a snapshot, so it cannot reliably clean up processes created between the lookup and the termination, or those reparented after the parent exited.
+To end the descendants in one go, you have to manage them with OS-level process groups or cgroups.
+
+==== Terminating by Process Group
+
+For commands whose descendants stay in the same process group, you can run them under `setsid` to create a new session and group, and then signal the whole group to clean up once the work is done.
+The JDK API has no facility for creating a process group or signaling one, so this is put together by running the `setsid` and `kill` commands.
+
+[source,java]
+.ProcessGroupKillDemo.java
+----
+public static void main(String[] args) throws Exception {
+    run("sleep 60 | cat");
+    run("(trap '' TERM; sleep 60) & sleep 60");
+    run("setsid sleep 60 & sleep 60");
+}
+
+static void run(String script) throws Exception {
+    Process process = new ProcessBuilder("setsid", "sh", "-c", script).start();
+    List<ProcessHandle> descendants = List.of();
+    try {
+        if (!process.waitFor(1, TimeUnit.SECONDS)) {
+            descendants = process.descendants().toList(); // snapshot for checking the result
+        }
+    } finally {
+        killGroup(process.pid()); // the PID of the child, now a group leader via setsid, is the process group ID
+        process.waitFor();
+    }
+
+    List<String> left = descendants.stream()
+            .filter(ProcessHandle::isAlive)
+            .map(p -> p.info().commandLine().orElse("?"))
+            .toList();
+    System.out.println("[" + script + "] pgid=" + process.pid() + ", left=" + left);
+    descendants.forEach(ProcessHandle::destroyForcibly);
+}
+
+static void killGroup(long pgid) throws Exception {
+    signalGroup("TERM", pgid);
+    if (!awaitGroupExit(pgid, 5)) {
+        signalGroup("KILL", pgid);
+        awaitGroupExit(pgid, 5);
+    }
+}
+
+static boolean awaitGroupExit(long pgid, long seconds) throws Exception {
+    long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(seconds);
+    while (signalGroup("0", pgid)) {
+        if (System.nanoTime() > deadline) {
+            return false;
+        }
+        Thread.sleep(100);
+    }
+    return true;
+}
+
+// an exit code of 0 from kill means at least one process in the group received the signal
+static boolean signalGroup(String signal, long pgid) throws Exception {
+    Process kill = new ProcessBuilder("kill", "-" + signal, "--", "-" + pgid)
+            .redirectErrorStream(true)
+            .redirectOutput(Redirect.DISCARD)
+            .start();
+    return kill.waitFor() == 0;
+}
+----
+
+The util-linux `setsid` command only calls `fork()` when the calling process is already a group leader; otherwise it calls `setsid()` in its own process and then executes the command. A child created by the JVM is not a group leader, so its PID does not change and `process.pid()` can be used as the ID of the new group.
+Passing a negative PID argument to `kill` sends the signal to the entire process group whose ID is the absolute value. The exception is `-1`, which means every process you have permission to signal rather than a group. Because kill treats arguments starting with `-`, such as `-9` or `-KILL`, as signals, `--` is placed before the PID so that `-295952` is read as a PID. Signal number 0 sends no actual signal and only checks that the target exists and that you have permission, so if `kill -0` succeeds, processes remain in the group.
+
+`waitFor()` only waits for the shell, the direct child, so the shell exiting does not mean the whole group has exited. That is why `killGroup()` sends SIGTERM, then waits up to 5 seconds while checking with `kill -0` whether any processes remain in the group, and sends SIGKILL to the whole group if some are still there.
+The cleanup is done in `finally`, always, not only on timeout. Even when the direct child exits normally, descendants started in the background can remain. For example, with a script that only runs `sleep 60 &`, the shell exits immediately and `waitFor()` returns `true`, but the `killGroup()` in `finally` cleans up the leftover `sleep`.
+
+[source,text]
+.Output of ProcessGroupKillDemo.java
+----
+[sleep 60 | cat] pgid=295952, left=[]
+[(trap '' TERM; sleep 60) & sleep 60] pgid=295959, left=[]
+[setsid sleep 60 & sleep 60] pgid=296018, left=[/usr/bin/sleep 60]
+----
+
+The `sleep` and `cat` of the first command were in the same group as the shell, so SIGTERM ended them together.
+The shell of the second command ended immediately on SIGTERM, but the `sleep`, which was run to ignore SIGTERM, ended on SIGKILL after the 5-second grace period. Had SIGKILL been skipped on seeing only that the shell had exited, this `sleep` would have remained.
+In the third command, the `sleep` run under `setsid` moved to a new session and group, so it did not receive the signal sent to the group. When a descendant moves to a new session or a different group with `setsid()` or `setpgid()`, this method cannot clean it up. The daemon-style programs seen earlier fall into this category.
+
+
+==== Terminating by cgroup
+
+cgroup (control group) is a Linux kernel feature that groups processes into a hierarchy to limit and measure resources such as CPU, memory, I/O, and the number of processes. The memory limits of Docker containers also work through cgroups.
+A child created with `fork()` starts out in its parent's cgroup, so grandchildren and all descendants below them end up in the same cgroup.
+`setsid()` changes only the session and the process group, not the cgroup. In cgroup v2, moving a process to another cgroup requires write permission on the `cgroup.procs` file of the common ancestor of the source and destination cgroups. So a descendant without that permission cannot escape the cgroup.
+The cgroup the current process belongs to can be seen in `/proc/self/cgroup`, and the whole tree with the `systemd-cgls` command.
+
+systemd creates a separate cgroup for each service, and when it stops a service it terminates every process left in that cgroup (`KillMode=control-group` is the default).
+With `systemd-run --scope`, the same approach can be applied to a one-off command. The code below runs the command that escaped the process group earlier as a transient scope unit and stops that unit when the job is done.
+
+[source,java]
+.SystemdScopeDemo.java
+----
+String unit = "job-" + UUID.randomUUID() + ".scope";
+Process process = new ProcessBuilder(
+        "systemd-run", "--user", "--scope", "--quiet", "--unit=" + unit,
+        "sh", "-c", "setsid sleep 60 & sleep 60")
+        .redirectError(Redirect.INHERIT)
+        .start();
+List<ProcessHandle> descendants = List.of();
+try {
+    if (process.waitFor(1, TimeUnit.SECONDS)) {
+        System.out.println("exit=" + process.exitValue()); // a failure of systemd-run also shows up here
+    } else {
+        System.out.println("cgroup: " + Files.readString(Path.of("/proc/" + process.pid() + "/cgroup")).trim());
+        descendants = process.descendants().toList(); // snapshot for checking the result
+    }
+} finally {
+    int stopExit = new ProcessBuilder("systemctl", "--user", "stop", unit)
+            .redirectError(Redirect.INHERIT)
+            .start()
+            .waitFor();
+    System.out.println("systemctl stop exit=" + stopExit);
+    if (!process.waitFor(10, TimeUnit.SECONDS)) {
+        process.destroyForcibly().waitFor();
+    }
+}
+
+List<String> left = descendants.stream()
+        .filter(ProcessHandle::isAlive)
+        .map(p -> p.info().commandLine().orElse("?"))
+        .toList();
+System.out.println("descendants=" + descendants.size() + ", left=" + left);
+----
+
+[source,text]
+.Output of SystemdScopeDemo.java
+----
+cgroup: 0::/user.slice/user-1000.slice/user@1000.service/app.slice/job-0fbacb17-d0c0-47de-a65d-db30d90ecfb1.scope
+systemctl stop exit=0
+descendants=2, left=[]
+----
+
+When run with `--scope`, `systemd-run` waits for the scope unit to start and then replaces its own process with the command, so the PID does not change. The command is still a direct child of the JVM, so you can read its output and wait for it to exit through `Process` just as in the earlier examples.
+The cgroup path in the output ends with `job-...scope`, which confirms that the command ran in a dedicated cgroup. When `systemctl stop` was called, both descendants ended, including the `sleep` that had left the group with `setsid`.
+`systemctl stop` sends SIGTERM first, then SIGKILL to any process that has not exited within the grace period (`TimeoutStopSec`). The grace period can be set on `systemd-run` with an option such as `-p TimeoutStopSec=5s`.
+
+A scope is not tied to a specific process; it stays alive as long as at least one process remains in it. Even if the shell exits first, the scope remains active while a descendant launched in the background is still around, so the unit is always stopped in `finally`, as in the earlier process group example.
+If `systemd-run` fails, for example because it cannot connect to the user bus, it prints an error to stderr and exits with a nonzero exit code, so the example passes stderr through to the parent and prints the exit code. It also checks the exit code of `systemctl stop` and puts a time limit on `waitFor()` so that it does not wait forever when cleanup fails. If the command finished first and the scope is already gone, `systemctl stop` returns exit code 5, meaning the unit does not exist, so real code should treat that case as normal.
+
+This approach has preconditions.
+
+* Using `--user` requires the user's systemd instance to be running. For a service account on a server with no login session, either keep the user instance alive with `loginctl enable-linger` or use the privileged system instance.
+* Most containers have no systemd inside, so this approach cannot be used there. In that case, consider running a separate container per job and cleaning up at the container level.
+* If you have been delegated permission to manage cgroup v2 directly without systemd, you can create a cgroup for the job, start the command inside it, and then write `1` to the `cgroup.kill` file to send SIGKILL to every process, including those in child cgroups. This file is supported since Linux 5.14.
+
+Whichever approach you take, the target job must be started inside that cgroup from the beginning, and the permission to move out of it must be managed together with the termination policy.
+
+To sum up, if you control the command you run and it does not become a daemon, the process group approach is enough. If you run arbitrary scripts or commands received from outside, cleaning up by cgroup is the more reliable choice.
+The libraries in the next section also cut down the code for output handling and timeouts, but they do not solve all of these conditions.
+
+== Using zt-exec and Apache Commons Exec
+
+Writing code by hand that covers everything from the previous chapter, the output pipes, EOF on stdin, timeouts, and the termination policy, is not easy.
+Even with a good understanding of the principles, reimplementing this code in every project is tedious.
+In practice, using a library that already has this handling built in is the pragmatic choice.
+
+The representative libraries in this area are zt-exec and Apache Commons Exec.
+Both drain the output pipes on separate threads, and when no input is specified, a class named `PumpStreamHandler` closes the child process's stdin so that the child receives EOF.
+zt-exec's `PumpStreamHandler` class is taken from Commons Exec, to the point that the top of its source file says "This file originates from the Apache Commons Exec package". The main differences compared in this article are the shape of the API and the defaults.
+
+=== zt-exec
+
+https://github.com/zeroturnaround/zt-exec[zt-exec] is a library that ZeroTurnaround, the maker of JRebel, released in 2013 after consolidating the process execution code scattered across its internal projects.
+Its official name is ZT Process Executor, as the title of the https://github.com/zeroturnaround/zt-exec/blob/v1.13.0/README.md[README] says, but since the GitHub repository and the Maven artifactId are zt-exec, it is usually called zt-exec. This article uses zt-exec as well.
+The README explains that the goal is to provide all the functionality of `ProcessBuilder` and Commons Exec through a single `ProcessExecutor` class.
+Its only dependency is slf4j-api, and the minimum Java version is 8.
+
+[source,xml]
+----
+<dependency>
+    <groupId>org.zeroturnaround</groupId>
+    <artifactId>zt-exec</artifactId>
+    <version>1.13.0</version>
+</dependency>
+----
+
+The advantages of zt-exec are as follows.
+
+* **The defaults are safe.** Calling `execute()` with no configuration merges stderr into stdout and discards that output. The deadlock caused by an unread pipe does not happen with the defaults. If you need the output, turn on `readOutput(true)` and get a string from the result's `outputUTF8()`, or pass a function that handles the output line by line to `redirectOutput()` as a lambda expression.
+* **Timeouts are distinguished by exception type.** When the wait in `execute()` exceeds the time set with `timeout()`, the caller receives a `TimeoutException`, and the worker thread attempts termination with the stopper. An invalid exit code and a timeout can be told apart by exception type alone. However, there is no guarantee that the stopper has finished terminating the process at the moment the exception is caught. The default stopper only calls `destroy()`, so on Linux it does not forcibly kill a process that ignores SIGTERM. The termination method can be changed with `stopper()`. Implement the `ProcessStopper` interface with a policy that calls `destroy()`, waits for a grace period, and then calls `destroyForcibly()`.
+* **Exit code checking is declarative.** By default every exit code is allowed, and when you specify the allowed range with `exitValueNormal()` or `exitValues(0, 1)`, any other value raises an `InvalidExitValueException`. The exception object's `getResult()` gives access to the output up to that point, which is handy for logging the error message.
+* **Auxiliary features are simple to configure.** `start().getFuture()` runs the process asynchronously. However, `start()` ignores the `timeout()` setting, so you must limit the wait with something like `Future.get(timeout, unit)` and handle cancellation and termination separately on timeout. A timeout from `get()` alone does not terminate the process. `destroyOnExit()` requests termination of the child process from a JVM shutdown hook. `redirectOutputAsInfo()` can forward the output to an SLF4J logger, but this method is deprecated and `redirectOutput(Slf4jStream.of(logger).asInfo())` is the recommended API.
+
+Here is an example that runs the four commands from the previous chapter with zt-exec.
+
+[source,java]
+.ZtExecRunner.java
+----
+static void captureOutput() throws IOException, InterruptedException, TimeoutException {
+    ProcessResult result = new ProcessExecutor()
+            .command("echo", "hello")
+            .readOutput(true)
+            .exitValueNormal()
+            .execute();
+    System.out.println("output=" + result.outputUTF8().trim() + ", exit=" + result.getExitValue());
+}
+
+static void largeOutput() throws IOException, InterruptedException, TimeoutException {
+    AtomicLong lines = new AtomicLong();
+    ProcessResult result = new ProcessExecutor()
+            .command("seq", "1", "100000")
+            .redirectOutput(line -> lines.incrementAndGet())
+            .timeout(3, TimeUnit.SECONDS)
+            .execute();
+    System.out.println("seq lines=" + lines.get() + ", exit=" + result.getExitValue());
+}
+
+static void timeout() throws IOException, InterruptedException {
+    try {
+        new ProcessExecutor()
+                .command("sleep", "60")
+                .timeout(1, TimeUnit.SECONDS)
+                .execute();
+    } catch (TimeoutException e) {
+        System.out.println("timeout: " + e.getMessage());
+    }
+}
+
+static void exitValue() throws IOException, InterruptedException, TimeoutException {
+    try {
+        new ProcessExecutor()
+                .command("ls", "/no-such-dir")
+                .readOutput(true)
+                .exitValueNormal()
+                .execute();
+    } catch (InvalidExitValueException e) {
+        System.out.println("exit=" + e.getExitValue() + ", output=" + e.getResult().outputUTF8().trim());
+    }
+}
+----
+
+Here is the output. The message of the `TimeoutException` contains the executed command and the time limit, and the error message from `ls` is read with `outputUTF8()` thanks to the default that merges stderr into stdout. I also confirmed that no `sleep` process was left behind after the timeout.
+
+[source,text]
+.Output of ZtExecRunner.java
+----
+output=hello, exit=0
+seq lines=100000, exit=0
+timeout: Timed out waiting for Process[pid=294823, exitValue="not exited"] to finish, timeout: 1 second, executed command [sleep, 60]
+exit=2, output=ls: cannot access '/no-such-dir': No such file or directory
+----
+
+There are caveats as well. With `readOutput(true)`, the thread reading the output pipe stores every byte it reads in a `ByteArrayOutputStream`. When the result is built, `toByteArray()` copies it once more, and calling `outputUTF8()` creates a string as well. Since `ByteArrayOutputStream` doubles its size when the buffer fills up, the internal buffer alone can grow larger than the output, and a string containing characters outside Latin-1, such as Korean, uses 2 bytes per character. So peak memory usage can exceed twice the size of the output.
+
+If you do not need to keep the entire output, you can leave `readOutput` off and pass a line-by-line handler to `redirectOutput()`, as in `largeOutput()` above. The buffer size in this approach depends on the length of the longest line rather than the total output. Huge output with no line breaks still takes a lot of memory, and if the handler is slow, the child process's output backs up as well. Such output is better sent to a file or to an `OutputStream` that works with a fixed-size buffer.
+
+This example used SLF4J API 2.0.17, so with no implementation present, three lines of warnings including "No SLF4J providers were found" appeared during initialization. The dependency declared in the POM of zt-exec 1.13.0 is SLF4J API 1.7.32, and the warning text in that version is different. If you do not need logging, you can add the `slf4j-nop` that matches the SLF4J API you use to silence the warning.
+
+=== Apache Commons Exec
+
+https://commons.apache.org/proper/commons-exec/[Apache Commons Exec] is a library that composes command execution, output stream handling, and timeouts from `DefaultExecutor`, `PumpStreamHandler`, and `ExecuteWatchdog`, respectively. Version 1.6.0, used in this article, runs on Java 8 or later and has no external dependencies. `DefaultExecutor` and `ExecuteWatchdog` are created with a builder API, and the timeout is specified as a `Duration`. The old constructors are marked deprecated.
+
+[source,xml]
+----
+<dependency>
+    <groupId>org.apache.commons</groupId>
+    <artifactId>commons-exec</artifactId>
+    <version>1.6.0</version>
+</dependency>
+----
+
+Here is an example that runs the same four commands with 1.6.0. The `PumpStreamHandler` class in charge of stream handling writes to `System.out` and `System.err` by default, so to collect the output you pass your own `OutputStream` instances as below.
+
+[source,java]
+.CommonsExecRunner.java
+----
+static void run(String... command) throws IOException {
+    CommandLine cmdLine = new CommandLine(command[0]);
+    cmdLine.addArguments(Arrays.copyOfRange(command, 1, command.length), false);
+    ByteArrayOutputStream stdout = new ByteArrayOutputStream();
+    ByteArrayOutputStream stderr = new ByteArrayOutputStream();
+    ExecuteWatchdog watchdog = ExecuteWatchdog.builder().setTimeout(Duration.ofSeconds(1)).get();
+    DefaultExecutor executor = DefaultExecutor.builder().get();
+    executor.setStreamHandler(new PumpStreamHandler(stdout, stderr));
+    executor.setWatchdog(watchdog);
+    try {
+        int exitValue = executor.execute(cmdLine);
+        System.out.println(command[0] + ": exit=" + exitValue + ", stdout bytes=" + stdout.size());
+    } catch (ExecuteException e) {
+        System.out.println(command[0] + ": exit=" + e.getExitValue()
+                + ", killed by watchdog=" + watchdog.killedProcess()
+                + ", stderr=" + stderr.toString().trim());
+    }
+}
+----
+
+[source,text]
+.Output of CommonsExecRunner.java
+----
+echo: exit=0, stdout bytes=6
+seq: exit=0, stdout bytes=588895
+sleep: exit=143, killed by watchdog=true, stderr=
+ls: exit=2, killed by watchdog=false, stderr=ls: cannot access '/no-such-dir': No such file or directory
+----
+
+On Linux, `DefaultExecutor` throws an `ExecuteException` for a nonzero exit code by default.
+The exit codes that are not treated as errors can be changed with `setExitValue()` or `setExitValues()`, and the check can be turned off with `setExitValues(null)`.
+The `sleep` in the output above ended from the SIGTERM sent by the watchdog, so its exit code is 143.
+In this example, after catching the exception, `watchdog.killedProcess()` is used to tell whether the watchdog intervened.
+However, this method indicates whether `destroy()` was called and does not guarantee that the process actually terminated.
+The `ExecuteWatchdog` in 1.6.0 only calls `destroy()` on timeout and has no API for escalating to a forcible kill.
+If you need a forcible kill, you have to write separate code that finds the processes left after the timeout through `ProcessHandle` and calls `destroyForcibly()`.
+If the command ignores SIGTERM, `execute()` may keep waiting. Conversely, if a command that handles SIGTERM exits with an allowed code, `execute()` may return without an exception even after the timeout. So `killedProcess()` must be checked on the normal return path as well.
+
+=== Maintenance Status and Recommendation
+
+Below is the status of the two libraries as of 2026-09-06, checked against the version list on Maven Central and each project's change log.
+
+[cols="1,2,2", options="header"]
+|===
+|Item |zt-exec |Apache Commons Exec
+
+|Latest version
+|1.13.0 (2026-07-10)
+|1.6.0 (2025-11-25)
+
+|Previous releases
+|1.12 (2020-09-02), 1.11 (2019-07-05)
+|1.5.0 (2025-05-16), 1.4.0 (2024-01-01), 1.3 (2014-11-02)
+
+|Releases in the last 5 years
+|1
+|3
+
+|Minimum Java version
+|8
+|8
+
+|Dependencies
+|slf4j-api
+|None
+
+|Default output handling
+|Discarded (stderr merged into stdout)
+|Written to `System.out` and `System.err`
+
+|Timeout notification
+|`TimeoutException`
+|Checked with `watchdog.killedProcess()` (`ExecuteException` if the exit code is a failure)
+
+|Nonzero exit code
+|Allowed by default, `InvalidExitValueException` when restricted with `exitValues()`
+|`ExecuteException` by default
+
+|Termination on timeout
+|`destroy()`, replaceable with `stopper()`
+|`destroy()` only
+|===
+
+Of the two, I recommend zt-exec.
+Its API design has three advantages.
+It distinguishes timeouts from exit code errors by exception type, it takes a single method call to receive the output as a string, and its default settings avoid the deadlock caused by not reading the output pipe.
+Both libraries use `destroy()` as the default termination request. zt-exec lets you add a forcible termination policy with `stopper()`, but Commons Exec requires separate code.
+
+
+== Process Creation on Linux
+
+**Java developers running JDK 25 on Linux today can leave the `jdk.lang.Process.launchMechanism` option unset and keep the default, `POSIX_SPAWN`.** It has been the default since JDK 13.
+To see why, this chapter first reviews the three ways Linux offers to create a process and the history of the JDK default, then looks in turn at how `POSIX_SPAWN` works, the memory cost and launch latency of the `FORK` alternative, and finally the `VFORK` setting to clean up when upgrading the JVM.
+
+=== Three Ways to Create a Process and the History of the JDK Default
+
+An application's code for launching an external process passes through the JVM and ends up as a kernel system call or a C library function call.
+Which function call creates the child process matters because this choice has led to real production failures in the past. The classic case is a JVM with a large heap failing to allocate memory while trying to run a single external command. The 2015 NAVER D2 article https://d2.naver.com/helloworld/1113548[Running external processes in Java (NAVER D2, 2015, in Korean)] describes a Tomcat server configured with a large heap on which launching an external process failed with a `Cannot allocate memory` exception. The OpenJDK issue tracker also records this history. The title of https://bugs.openjdk.org/browse/JDK-6868160[JDK-6868160], which landed in JDK 7, is "(process) Use vfork, not fork, on Linux to avoid swap exhaustion". In other words, changing the call that creates the child process was a measure to avoid swap exhaustion. That you can now simply leave the default alone is the result of these problems being solved one after another.
+
+To run another program on Linux, you pair a call that creates a child process with `execve()`, the system call that replaces that child with another program. The part where you have a choice is the first half, that is, how to create the child. There are three candidates.
+
+* `fork()`: a system call that creates a child by duplicating the parent's address space.
+* `vfork()`: a system call that creates a child that shares the parent's address space instead of duplicating it.
+* `posix_spawn()`: a C library function that bundles child creation and `execve()` together.
+
+The Linux kernel handles the `fork()`, `vfork()`, and `clone()` system calls with the same function, `kernel_clone()`, and flags determine what is shared with the parent. In glibc 2.39 on x86-64, the environment used for this article, the `fork()` function invokes the `clone()` system call, while the `vfork()` function invokes the separate `vfork()` system call directly. Even in the same glibc 2.39, the https://github.com/bminor/glibc/blob/glibc-2.39/sysdeps/unix/sysv/linux/aarch64/vfork.S[AArch64 vfork implementation] uses the `clone()` system call, so the call path differs by architecture. The https://man7.org/linux/man-pages/man2/vfork.2.html[vfork(2)] manual describes `vfork()` as equivalent to `clone()` with the flags `CLONE_VM | CLONE_VFORK | SIGCHLD`. These flags appear in the strace output later in this chapter.
+
+Only `posix_spawn()` sits at a different layer. It is a function specified by POSIX and implemented by the C library, so it has no corresponding system call; internally it picks one of the two methods above, or a `clone()` with the same flags as `vfork()`.
+The JDK does not implement any of the three methods itself; all three call glibc functions.
+You can confirm this in the dynamic symbols of `libjava.so`, which contains the JVM's process creation code.
+
+[source,text]
+----
+$ nm -D $JAVA_HOME/lib/libjava.so | grep -E 'posix_spawn|fork'
+                 U fork@GLIBC_2.2.5
+00000000000125c0 T Java_java_lang_ProcessImpl_forkAndExec
+                 U posix_spawn@GLIBC_2.15
+                 U vfork@GLIBC_2.2.5
+----
+
+`T` marks a symbol this file defines, and `U` marks a symbol it does not define and looks up in another library at run time.
+What OpenJDK built is the native method `forkAndExec`; the functions corresponding to the three launch mechanisms are all linked to glibc symbols carrying `@GLIBC_` version tags.
+So even with the same `POSIX_SPAWN` setting, the actual behavior depends on the libc and its version.
+A JDK linked against musl rather than glibc gets musl's implementation in the same place.
+
+The pros and cons of the three methods are as follows.
+
+[cols="1,2,2", options="header"]
+|===
+|Method |Advantages |Disadvantages
+
+|`fork()`
+|The child's address space is separate, so it can do preparation work such as cleaning up file descriptors or changing the working directory without corrupting the parent's memory
+|Copy-on-write defers copying the pages, but the page tables are copied, so the larger the heap the higher the creation cost, and the call is subject to the kernel's overcommit check
+
+|`vfork()`
+|The page tables are not copied, so the creation cost is nearly independent of the parent's heap size
+|Behavior is undefined if the child does anything other than `execve()` or `_exit()`, and the parent's calling thread is blocked in the meantime
+
+|`posix_spawn()`
+|Preparation work is handled in the way the library defines, and since glibc 2.24 it uses `CLONE_VM` to avoid copying the page tables as well
+|The preparation work the child can do is limited to what the library supports, and the internal implementation varies with the libc and its version
+|===
+
+That said, `fork()` does not mean the child may call arbitrary functions before `execve()` either. The https://man7.org/linux/man-pages/man2/fork.2.html[fork(2)] manual restricts the functions a `fork()`ed child in a multithreaded program can safely call before `execve()` to async-signal-safe functions. The other threads are not duplicated into the child, but the lock state those threads were holding can remain.
+
+The vfork(2) manual describes the cost of `fork()` as "the time and memory required to duplicate the parent's page tables, and to create a unique task structure for the child".
+This cost grows with the parent's heap size. In the measurements later in this chapter, running one command with the `FORK` mechanism took 16 to 20 ms with a 256MB heap but 230 to 240 ms with an 8GB heap.
+The constraints on `vfork()` are stated even more strongly in the https://man7.org/linux/man-pages/man2/vfork.2.html[vfork(2)] manual. Modifying any data other than the `pid_t` variable that holds the return value, returning from the function that called `vfork()`, or calling any function other than `_exit()` and `execve()` results in undefined behavior. Because the child modifies memory and a stack it shares with the parent, the outcome after the parent resumes cannot be predicted.
+
+OpenJDK went through these three methods in turn. It used `fork()` at first, but when the creation cost became a problem with large heaps, JDK 7 switched the default to `vfork()`. The JDK, however, did preparation work between `vfork()` and `execve()`, closing file descriptors and changing the working directory, which violated the `vfork()` constraints we just saw. It was a choice that reduced the launch cost at the expense of safety. `POSIX_SPAWN`, the default since JDK 13, moves this preparation work into a separate process that does not share memory with the parent, avoiding both the copying cost of `fork()` and the constraint violations of `vfork()`.
+
+The three methods correspond to the values `FORK`, `VFORK`, and `POSIX_SPAWN` of the implementation-specific system property `jdk.lang.Process.launchMechanism`.
+These three values are declared in https://github.com/openjdk/jdk/blob/jdk-25%2B36/src/java.base/unix/classes/java/lang/ProcessImpl.java[ProcessImpl.java] in JDK 25, and on Linux all three can be specified, though `VFORK` comes with a warning.
+The history of the default is shown below. The JDK 27 entry is not a GA release result but what has been merged into the development build as of 2026-09-06.
+
+[cols="1,3", options="header"]
+|===
+|JDK |Change on Linux
+
+|6
+|`fork()` + `execve()`
+
+|7
+|`vfork()` becomes the default (https://bugs.openjdk.org/browse/JDK-6868160[JDK-6868160])
+
+|12
+|`POSIX_SPAWN` added as an optional mechanism (https://bugs.openjdk.org/browse/JDK-8212828[JDK-8212828]). Also backported to 11.0.4
+
+|13
+|`POSIX_SPAWN` becomes the default (https://bugs.openjdk.org/browse/JDK-8213192[JDK-8213192])
+
+|25
+|Specifying `VFORK` prints a deprecation warning (https://bugs.openjdk.org/browse/JDK-8357180[JDK-8357180])
+
+|27
+|`VFORK` removed in the development build. Specifying it prints a warning and falls back to `FORK` (https://bugs.openjdk.org/browse/JDK-8357089[JDK-8357089], https://bugs.openjdk.org/browse/JDK-8357090[CSR])
+|===
+
+Why `VFORK` went away, and how to clean up any remaining setting, is covered in the last section of this chapter.
+The next section looks at how `POSIX_SPAWN`, the default since JDK 13, moves the preparation work into a separate process.
+
+=== How POSIX_SPAWN Works
+
+`posix_spawn()` bundles child creation, `execve()`, and the preparation work in between into a single call.
+It is similar to `CreateProcess()` on Windows.
+The JDK uses this function to first launch a small executable called `jspawnhelper`; `jspawnhelper` cleans up file descriptors and the working directory according to the settings it receives over a pipe, then `execve()`s the actual command. This structure is described in the comment at the top of https://github.com/openjdk/jdk/blob/jdk-25%2B36/src/java.base/unix/native/libjava/ProcessImpl_md.c[ProcessImpl_md.c] in the JDK 25 source.
+
+The reason for the extra hop through the helper is the safety problem from the previous section.
+Doing preparation work such as closing file descriptors and changing the working directory inside jspawnhelper, which was launched by the first `execve()` and is therefore a separate process that does not share memory with the parent, does not violate the `vfork()` constraints.
+The same comment describes this as "moving the preparation work after the first exec to narrow the vulnerable window".
+
+Viewed with strace, a tool that records the system calls a program makes in order, `execve` appears twice.
+Below is the process-creation-related portion of the system calls made when link:{source-repo}/ProcessRunner.java[ProcessRunner.java], which runs `echo hello`, is executed with the default settings. Paths have been shortened.
+
+[source,text]
+----
+$ strace -f -e trace=clone,clone3,vfork,execve -o trace.txt java ProcessRunner
+$ grep -v CLONE_THREAD trace.txt | grep -E 'clone|vfork|execve'
+285583 clone3({flags=CLONE_VM|CLONE_VFORK|CLONE_CLEAR_SIGHAND, exit_signal=SIGCHLD, stack=..., stack_size=0x9000}, 88 <unfinished ...>
+285603 execve("$JAVA_HOME/lib/jspawnhelper", ["$JAVA_HOME/lib/jspawnhelper", "25+36-LTS", "10:11:13"], ...) = 0
+285603 execve("/usr/bin/echo", ["echo", "hello"], ...) = 0
+----
+
+No `vfork()` system call appeared in this run.
+`posix_spawn()` in glibc 2.39 created the child with the `clone3` system call, passing the `CLONE_VM` and `CLONE_VFORK` flags.
+Depending on the environment, the `clone()` system call may be used instead. The https://github.com/bminor/glibc/blob/glibc-2.39/sysdeps/unix/sysv/linux/spawni.c[posix_spawn implementation] in glibc 2.39 falls back to `clone()` if the `clone3` call fails with `ENOSYS` or `EINVAL`.
+`CLONE_VM` means the child shares the parent's address space as is, so the heap mappings and page tables are not copied.
+`CLONE_VFORK` blocks the parent's calling thread until the child `execve()`s or exits.
+Thanks to `CLONE_VM`, the creation cost is nearly independent of heap size.
+The measurements later in this chapter confirm this. Running the same program with `-Djdk.lang.Process.launchMechanism=FORK` invokes the `clone` system call without the `CLONE_VM` flag to duplicate the address space, and `execve`s `/usr/bin/echo` directly without `jspawnhelper`.
+
+According to the https://man7.org/linux/man-pages/man3/posix_spawn.3.html[posix_spawn(3)] manual, since glibc 2.24 `posix_spawn()` calls `clone()` with the `CLONE_VM` and `CLONE_VFORK` flags.
+It gives the child process a separate stack, blocks signals during creation, and resets the child's handlers, reducing the risks related to the parent's stack and signal handling.
+The comment in the JDK 25 source also describes the glibc 2.24 and later approach as the best choice for these reasons, and notes that musl has used this `clone()` approach as well.
+The `vfork()` function itself has not been removed from glibc.
+
+The fact that `jspawnhelper` is a separate executable can cause trouble when updating the JDK.
+If you overwrite the files in the JDK path used by a running JVM, the JVM code loaded in memory and the helper version on disk diverge, and launching external commands can fail.
+https://bugs.openjdk.org/browse/JDK-8325621[JDK-8325621] strengthened the helper's version check against the background of such mismatches caused by automatic updates.
+When updating the JDK, it is better not to overwrite the directory a running JVM uses, but to install into a new directory and switch to the new path when restarting the JVM.
+Helper launch errors can also have other causes, such as permission or installation problems, so check the error message and the installation state first.
+
+The https://bugs.openjdk.org/browse/JDK-8357090[CSR for JDK-8357090] explains that `FORK` is kept as an alternative so that unexpected problems with `posix_spawn()` can be worked around.
+If `jspawnhelper`-related errors keep recurring and the cause is hard to pin down right away, you can work around them temporarily by adding `-Djdk.lang.Process.launchMechanism=FORK` to the JVM startup options.
+This choice accepts the memory burden under the overcommit policy and the launch latency covered in the next section, and it is not a setting that takes effect immediately in a running JVM.
+
+=== Memory Cost and Launch Latency of FORK
+
+If you choose `FORK`, you have to take into account the cost of duplicating the parent JVM's address space.
+`fork()` creates a child process by duplicating the parent's virtual address space as is; Linux defers the actual copying of pages with copy-on-write, but it does copy the page tables.
+Depending on the kernel's memory overcommit policy, the kernel may compute in advance the memory the child might use and refuse to create it.
+This check applies even if the child is immediately replaced by a small program through `execve()`.
+
+The default value 0 of the Linux kernel setting `vm.overcommit_memory`, exposed through the `/proc/sys/vm/overcommit_memory` file, is a mode that "refuses only obvious overcommits".
+The kernel 5.1 code factored free memory, the page cache, free swap, and so on into this decision. If the size `fork()` required to duplicate the heap mappings exceeded this computed value, the call could be refused with `ENOMEM`, the error code meaning out of memory.
+
+The kernel has several rules to keep this decision from becoming too strict, and they have been reinforced as versions progressed. Two examples follow.
+
+* Even on a server that strictly enforces the commit limit with `vm.overcommit_memory=2`, the commit check at `fork()` time does not unconditionally add the size of the parent's entire address space. It counts only the size of the mappings the kernel includes in the commit total, such as private writable mappings.
+* The https://lkml.iu.edu/hypermail/linux/kernel/1904.1/05420.html[mm: fix false-positive OVERCOMMIT_GUESS failures] patch, merged in kernel 5.2, simplified the mode 0 decision to "does the requested size exceed the sum of total RAM and swap". This relaxed the condition that refused to duplicate large mappings merely because free memory was low.
+
+Even so, `FORK` does not always succeed. In mode 2, large anonymous private writable mappings such as the Java heap count toward the cost, so process creation fails if the remaining commit limit is exceeded, and even in mode 0 the actual allocation of kernel memory such as page tables can fail.
+
+Even when creation is not refused, the time cost remains.
+Although the overcommit decision was relaxed, the fact that `fork()` copies the page tables has not changed.
+The copying cost varies with factors such as the heap area actually touched and the page size.
+`POSIX_SPAWN`, by contrast, shares the address space through `CLONE_VM`, so there is no such copying.
+I measured, for each launch mechanism, the time taken to run the `true` command 30 times with the heap preallocated.
+The measurement code is link:{source-repo}/SpawnBench.java[SpawnBench.java]; I set `-Xms` and `-Xmx` to the same value and pre-touched the heap with the `-XX:+AlwaysPreTouch` option before measuring.
+Each run averaged 30 iterations of `start().waitFor()` after 5 warm-up iterations, so the figures include running the command and waiting for it to exit, not just the pure creation time.
+Below are the values from two runs at the time of writing.
+
+[cols="1,2,2", options="header"]
+|===
+|Heap size |POSIX_SPAWN (ms/run) |FORK (ms/run)
+
+|256MB
+|1.5, 1.2
+|15.9, 20.2
+
+|2GB
+|1.6, 1.9
+|120.8, 140.7
+
+|8GB
+|2.0, 2.1
+|243.5, 231.2
+|===
+
+In this measurement, `POSIX_SPAWN` stayed in the range of about 1 to 2 ms, while `FORK` slowed down as the heap grew, differing by more than 100 times at 8GB.
+This does not mean the cost is exactly proportional to heap size or that this ratio appears in every environment.
+A re-measurement on 2026-09-06 confirmed the same trend, but the absolute times differed.
+
+In the `FORK` mechanism, `dup_mmap()` in Linux 6.17, which duplicates the address space, copies the mappings and page tables while holding the parent process's address space lock (mmap_lock) in write mode.
+Meanwhile, other threads attempting memory mapping changes that need this lock have to wait.
+For a web application that runs external commands synchronously while handling requests, this cost can add to the response time.
+Unless you are temporarily working around a `jspawnhelper` problem, there is currently no reason to accept these drawbacks and change the default to `FORK`.
+
+=== Removing the VFORK Setting When Upgrading the JVM
+
+When upgrading the JVM to version 25 or later, it is best to remove any remaining `-Djdk.lang.Process.launchMechanism=VFORK` setting.
+The places where this setting may still linger are JVM launch scripts, `JAVA_OPTS` in Dockerfiles, and application server startup options.
+JDK 25 prints a warning, and with the change merged into the JDK 27 development build the setting is replaced by `FORK`, which can increase launch latency with large heaps.
+
+Because `vfork()` was the default on Linux from JDK 7 through 12, some projects wrote this property explicitly to preserve the previous behavior when the default changed to `POSIX_SPAWN` in JDK 13.
+Even in environments where glibc was older than 2.24 at the time, there was no need to specify this value.
+According to the comment in the https://github.com/openjdk/jdk/blob/jdk-13%2B33/src/java.base/unix/native/libjava/ProcessImpl_md.c[JDK 13 source], `posix_spawn()` in glibc 2.4 through 2.23 chooses between `fork()` and `vfork()` depending on the call arguments, and the way the JDK calls it meets the conditions for using `vfork()`.
+From glibc 2.24 onward, it changed to the `clone()`-based implementation with the separate stack and signal handling described earlier.
+There is no reason to specify this value today, so remove the property and return to the default.
+
+JDK 7's choice of `vfork()` as the default was controversial even at the time.
+`vfork()` is not a standard function.
+The STANDARDS section of the https://man7.org/linux/man-pages/man2/vfork.2.html[vfork(2)] manual says "None", and the HISTORY section notes that this function, which appeared in 3.0BSD, was marked OBSOLETE in POSIX.1-2001 and had its specification removed in POSIX.1-2008.
+4.4BSD made `vfork()` simply identical to `fork()`, and Linux also behaved the same as `fork()` until around 2.2.0-pre6, becoming an independent system call from 2.2.0-pre9.
+Still, what went away is not the kernel's `vfork()` but the JDK's `VFORK` mode.
+It was not because it was dropped from the standard, nor because the kernel changed, but because, as we saw earlier, the work the JDK itself did between `vfork()` and `execve()` was unsafe.
+
+Specifying this option in JDK 25 prints the following warning to standard error.
+
+[source,text]
+----
+$ java -Djdk.lang.Process.launchMechanism=VFORK ProcessRunner
+VFORK MODE DEPRECATED
+The VFORK launch mechanism has been deprecated for being dangerous.
+It will be removed in a future java version. Either remove the
+jdk.lang.Process.launchMechanism property (preferred) or use FORK mode
+instead (-Djdk.lang.Process.launchMechanism=FORK).
+----
+
+The examples and measurements in this article are based on JDK 25.
+When applying them to older JDKs, check the launch mechanism and the range of API support separately.
+For example, OpenJDK 11u can specify `POSIX_SPAWN` as an option from 11.0.4 on, but its default is `vfork()`, and the Linux implementation in OpenJDK 8u does not support this option as of 2026-09-06.
+
+== Conclusion
+
+Code that launches external processes must be designed with output handling, timeouts, and a termination policy together. If you do not need to process the output, use `Redirect.DISCARD` or `inheritIO()`; if you need stdout and stderr separately, read both streams concurrently. For commands that read stdin, close the stream after writing all the input so the command receives EOF. After a timeout, take care not only of the termination request but also of whether to kill forcibly and of resource cleanup.
+
+zt-exec and Commons Exec reduce this code. Compare their defaults for output and exit codes, how they signal a timeout, and their dependencies, and pick the one that fits your project. Neither library guarantees forcible termination with the default `destroy()` alone, and for cleaning up descendants you can send a signal to the processes remaining in the same group or terminate by cgroup.
+
+With JDK 25 on Linux, keeping the default `POSIX_SPAWN` is the safe choice.
+
+== References
+
+* JDK documentation
+** https://docs.oracle.com/en/java/javase/25/docs/api/java.base/java/lang/Process.html[Process (Java SE 25)]
+** https://docs.oracle.com/en/java/javase/25/docs/api/java.base/java/lang/ProcessBuilder.html[ProcessBuilder (Java SE 25)]
+** https://docs.oracle.com/en/java/javase/25/docs/api/java.base/java/lang/Runtime.html[Runtime (Java SE 25)]: why the `exec(String)` overloads are deprecated
+** https://github.com/openjdk/jdk/blob/jdk-25%2B36/src/java.base/share/classes/java/lang/Runtime.java[Runtime.java (JDK 25+36)]: the implementation of `exec()` delegating to `ProcessBuilder`
+** https://github.com/openjdk/jdk/blob/jdk-25%2B36/src/java.base/unix/native/libjava/ProcessImpl_md.c[ProcessImpl_md.c (JDK 25+36)]: comments explaining the pros and cons of each launch mechanism and the `posix_spawn()` implementations in glibc and musl
+* Libraries
+** https://github.com/zeroturnaround/zt-exec[ZT Process Executor (zt-exec)]: usage examples in the README
+** https://github.com/zeroturnaround/zt-exec/blob/main/CHANGELOG.md[ZT Process Executor CHANGELOG]: the changes in 1.13.0 and its release date
+** https://commons.apache.org/proper/commons-exec/[Apache Commons Exec]
+** https://commons.apache.org/proper/commons-exec/changes.html[Apache Commons Exec Changes]: the builder API and the introduction of `Duration` since 1.4.0
+* OpenJDK issues
+** https://bugs.openjdk.org/browse/JDK-6868160[JDK-6868160 (process) Use vfork, not fork, on Linux to avoid swap exhaustion]
+** https://bugs.openjdk.org/browse/JDK-8212828[JDK-8212828 (process) Provide a way for Runtime.exec to use posix_spawn on linux]
+** https://bugs.openjdk.org/browse/JDK-8213192[JDK-8213192 (process) Change the Process launch mechanism default on Linux to be posix_spawn]
+** https://bugs.openjdk.org/browse/JDK-8357180[JDK-8357180 Deprecate VFORK launch mechanism from Process implementation (linux)]
+** https://bugs.openjdk.org/browse/JDK-8357090[JDK-8357090 Remove VFORK launch mechanism from Process implementation (linux)]
+** https://github.com/openjdk/jdk/commit/ca3fe721ba23a1304089b71c1b58940f16a0d053[JDK-8357089 implementation commit]: the removal of `VFORK` and its replacement with `FORK` in the JDK 27 development build
+** https://openjdk.org/jeps/486[JEP 486: Permanently Disable the Security Manager]
+* Linux manuals and kernel
+** https://man7.org/linux/man-pages/man7/pipe.7.html[pipe(7)]: pipe capacity
+** https://man7.org/linux/man-pages/man1/setsid.1.html[setsid(1)]: running without forking when not a group leader
+** https://man7.org/linux/man-pages/man2/setsid.2.html[setsid(2)], https://manpages.ubuntu.com/manpages/noble/man1/kill.1.html[kill(1) (procps-ng)], https://man7.org/linux/man-pages/man2/kill.2.html[kill(2)]: creating a new session, signaling a group with a negative PID, checking existence with signal 0
+** https://man7.org/linux/man-pages/man2/PR_SET_CHILD_SUBREAPER.2const.html[PR_SET_CHILD_SUBREAPER(2const)]: reparenting to a subreaper
+** https://docs.kernel.org/admin-guide/cgroup-v2.html[Control Group v2]: permission to move processes and `cgroup.kill`
+** https://www.freedesktop.org/software/systemd/man/latest/systemd-run.html[systemd-run(1)], https://www.freedesktop.org/software/systemd/man/latest/systemd.kill.html[systemd.kill(5)]: running as a scope unit and `KillMode`
+** https://man7.org/linux/man-pages/man2/vfork.2.html[vfork(2)]
+** https://man7.org/linux/man-pages/man3/posix_spawn.3.html[posix_spawn(3)]: the implementation since glibc 2.24
+** https://www.kernel.org/doc/html/latest/mm/overcommit-accounting.html[Overcommit Accounting]
+** https://github.com/torvalds/linux/blob/v5.2/mm/util.c[Linux 5.2 mm/util.c]: the mode 0 decision in `__vm_enough_memory()`
+** https://github.com/torvalds/linux/blob/v6.17/mm/mmap.c[Linux 6.17 mm/mmap.c]: the locking and page table duplication in `dup_mmap()`
+** https://lkml.iu.edu/hypermail/linux/kernel/1904.1/05420.html[mm: fix false-positive OVERCOMMIT_GUESS failures]: the kernel 5.2 patch that changed the heuristic
+* https://www.infoworld.com/article/2157336/when-runtime-exec-won-t.html[When Runtime.exec() won't]: Michael Daconta's article from 2000
+* https://d2.naver.com/helloworld/1113548[Running external processes in Java (NAVER D2, 2015, in Korean)]: the memory problem with `fork()` and the background to the adoption of `vfork()` in JDK 7
+* link:{source-repo}[Example code for this article]
+* https://blog.benelog.net/java-external-process.html[Korean original of this article]
+
+'''
+
+This post was translated from the Korean original by Sanghyuk Jung with help from Claude Code.
