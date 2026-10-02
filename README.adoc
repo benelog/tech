@@ -1,8 +1,8 @@
-= Naver Tech Notes
+= Benelog Tech Notes
 Engineering notes by Sanghyuk Jung, in English
 :toc:
 
-https://tech.navercorp.com/
+https://tech.benelog.net/
 
 The English-language counterpart of https://blog.benelog.net/[개발수양록]. Built with the same JBake toolchain.
 
@@ -46,7 +46,7 @@ output/               # build output (gitignored)
 
 Edit `src/jbake.properties`:
 
-* `site.host` : public URL (`https://tech.navercorp.com/`).
+* `site.host` : public URL (`https://tech.benelog.net/`).
 * `site.google.trackingid` : GA4 measurement ID (`G-...`). Empty disables the tag.
 * `site.giscus.*` : comment settings. Enable Discussions on the source repository, install the
   https://github.com/apps/giscus[giscus app], then copy `repo`, `repo_id`, `category`, and `category_id`

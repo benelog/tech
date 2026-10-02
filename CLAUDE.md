@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-English-language static tech blog ("Naver Tech Notes") by Sanghyuk Jung (benelog), served at https://tech.navercorp.com/.
+English-language static tech blog ("Benelog Tech Notes") by Sanghyuk Jung (benelog), served at https://tech.benelog.net/.
 Built with JBake 2.6.7 via the `org.jbake.site` Gradle plugin 5.5.0. The toolchain and templates are shared with the
 Korean blog in `../blog` (https://blog.benelog.net/); articles here are English rewrites or originals.
 

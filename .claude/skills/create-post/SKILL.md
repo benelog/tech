@@ -5,7 +5,7 @@ description: Writing guide for this English-language tech blog - post header fie
 
 # Blog Post Writing Guide
 
-Conventions for `src/content/*.adoc`. The site is served at https://tech.navercorp.com/ for an English-speaking
+Conventions for `src/content/*.adoc`. The site is served at https://tech.benelog.net/ for an English-speaking
 audience. Many articles are English rewrites of posts from the Korean blog https://blog.benelog.net/ ; when an
 article has a Korean original, link to it in the References section.
 
