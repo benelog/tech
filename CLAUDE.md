@@ -69,6 +69,12 @@ Layout chain: `header.ftl` → `menu.ftl` → page-specific template → `footer
 - `post/` — post partials (header, content, prev/next navigation)
 - `commons/` — shared partials (giscus comments, google-analytics, social links, share buttons)
 
+## Deployment
+
+Netlify, configured by `netlify.toml` (publish dir `output/`). `netlify-build.sh` downloads Temurin JDK 25
+because the Netlify build image ships no JDK, then runs `./gradlew bake`. Test it locally with
+`NETLIFY_BUILD_BASE=/tmp/x bash netlify-build.sh`.
+
 ## Key Config Notes
 
 - Comments: giscus (GitHub Discussions). Rendered only when `site.giscus.repo` is set; `repo_id` and `category_id` come from https://giscus.app.

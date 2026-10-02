@@ -42,6 +42,12 @@ fact-checks/          # fact-check records per article
 output/               # build output (gitignored)
 ----
 
+== Deployment
+
+Netlify builds the site from `main` using `netlify.toml`. The build image has no JDK 25, so
+`netlify-build.sh` downloads Temurin JDK 25 from Adoptium before running `./gradlew bake`,
+and Netlify publishes `output/`. The custom domain `tech.benelog.net` is managed in Netlify DNS.
+
 == Configuration
 
 Edit `src/jbake.properties`:
