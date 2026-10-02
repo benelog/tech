@@ -1,0 +1,71 @@
+= Naver Tech Notes
+Engineering notes by Sanghyuk Jung, in English
+:toc:
+
+https://tech.navercorp.com/
+
+The English-language counterpart of https://blog.benelog.net/[개발수양록]. Built with the same JBake toolchain.
+
+== Stack
+
+* http://jbake.org/[JBake] 2.6.7 (Gradle plugin `org.jbake.site` 5.5.0)
+* Gradle (wrapper included)
+* Comments: https://giscus.app[giscus] on GitHub Discussions
+* Analytics: Google Analytics 4
+
+== Requirements
+
+* JDK 25 (`.sdkmanrc` pins `25-tem`; run `sdk env` with https://sdkman.io/[SDKMAN])
+
+== Build
+
+[source,bash]
+----
+# Build the site into output/
+./gradlew bake
+
+# Clean build
+./gradlew clean bake
+----
+
+== Layout
+
+[source]
+----
+src/
+├── content/          # AsciiDoc (.adoc) posts and pages
+│   └── img/          # post images, one folder per topic slug
+├── templates/        # FreeMarker (.ftl) templates
+├── assets/           # CSS, JS, images served as-is
+└── jbake.properties  # site configuration
+fact-checks/          # fact-check records per article
+output/               # build output (gitignored)
+----
+
+== Configuration
+
+Edit `src/jbake.properties`:
+
+* `site.host` : public URL (`https://tech.navercorp.com/`).
+* `site.google.trackingid` : GA4 measurement ID (`G-...`). Empty disables the tag.
+* `site.giscus.*` : comment settings. Enable Discussions on the source repository, install the
+  https://github.com/apps/giscus[giscus app], then copy `repo`, `repo_id`, `category`, and `category_id`
+  from the snippet generated at https://giscus.app. Empty `site.giscus.repo` hides the comment section.
+
+== Writing a post
+
+Create `src/content/<slug>.adoc` with this header:
+
+[source,asciidoc]
+----
+= Post Title
+Sanghyuk Jung
+2026-10-03
+:jbake-type: post
+:jbake-status: published
+:jbake-tags: tag1, tag2
+:description: One-sentence summary
+:idprefix:
+----
+
+Images go in `src/content/img/<topic-slug>/`. See `.claude/skills/create-post/SKILL.md` for the full style guide.

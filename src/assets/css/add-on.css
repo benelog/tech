@@ -1,0 +1,105 @@
+/* Minimal additional styles */
+
+/* Blockquote attribution (book citation) */
+.quoteblock blockquote {
+    margin-bottom: 0;
+    border-radius: 12px 12px 0 0;
+}
+
+.quoteblock .attribution {
+    background-color: var(--color-primary-light);
+    border-radius: 0 0 12px 12px;
+    text-align: right;
+    font-size: 13px;
+    color: #666;
+    margin-top: 0;
+    padding: 4px 24px 12px;
+    font-style: italic;
+}
+
+.quoteblock .attribution cite {
+    font-style: normal;
+}
+
+.quoteblock {
+    margin-bottom: 32px;
+}
+
+/* AsciiDoc callout (conum): render the number inside the code and in the list below with the same circle */
+pre b.conum,
+.colist > ol > li::before {
+    display: inline-block;
+    box-sizing: border-box;
+    min-width: 20px;
+    height: 20px;
+    line-height: 20px;
+    padding: 0;
+    border-radius: 999px;
+    background-color: var(--color-primary);
+    color: #fff;
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+    font-size: 11px;
+    font-weight: 700;
+    font-style: normal;
+    text-align: center;
+}
+
+pre b.conum {
+    margin-left: 6px;
+    vertical-align: middle;
+}
+
+/* Override the gray that highlight.js applies when it wraps the number in a comment span */
+pre b.conum * {
+    color: #fff;
+}
+
+/* Attach the callout list to the code block right above it so they read as one unit */
+.listingblock:has(+ .colist) {
+    margin-bottom: 0;
+}
+
+.listingblock:has(+ .colist) pre {
+    border-bottom: none;
+    border-bottom-left-radius: 0;
+    border-bottom-right-radius: 0;
+}
+
+.listingblock + .colist {
+    background-color: var(--color-primary-light);
+    border: 1px solid var(--border-color);
+    border-radius: 0 0 12px 12px;
+    padding: 12px 20px;
+    margin-bottom: 20px;
+}
+
+.colist > ol {
+    counter-reset: conum;
+    list-style: none;
+    margin: 0;
+    padding: 0;
+}
+
+.colist > ol > li {
+    counter-increment: conum;
+    position: relative;
+    padding-left: 32px;
+    margin-bottom: 6px;
+    font-size: 14px;
+}
+
+.colist > ol > li:last-child {
+    margin-bottom: 0;
+}
+
+.colist > ol > li::before {
+    content: counter(conum);
+    position: absolute;
+    left: 0;
+    top: 1px;
+}
+
+/* Render tabs in source blocks as 4 columns (browser default is 8) */
+pre {
+    tab-size: 4;
+}

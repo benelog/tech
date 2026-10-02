@@ -1,0 +1,19 @@
+= About
+:jbake-type: page
+:jbake-status: published
+:idprefix:
+
+This blog collects engineering notes by Sanghyuk Jung (benelog): things learned while building and operating
+backend systems, mostly around Java, databases, build tools, and developer productivity.
+
+Most articles started as internal notes or as posts on the Korean-language blog
+https://blog.benelog.net/[개발수양록]. The pieces here are rewritten in English so that
+they can be shared with a wider audience. Where a Korean original exists, the article links to it.
+
+Comments run on GitHub Discussions, so a GitHub account is all you need to join the conversation.
+
+== Related sites
+
+* https://blog.benelog.net/ : the Korean-language blog
+* https://github.com/benelog : source code for examples referenced in the articles
+* https://www.linkedin.com/in/sanghyukjung/ : career profile

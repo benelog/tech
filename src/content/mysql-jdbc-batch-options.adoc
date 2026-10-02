@@ -1,0 +1,190 @@
+= MySQL JDBC Configuration for High-Performance Batch Jobs
+Sanghyuk Jung
+2026-10-03
+:jbake-type: post
+:jbake-status: published
+:jbake-tags: mysql, jdbc, spring-batch, java
+:description: Connector/J options that matter for batch workloads on MySQL - useServerPrepStmts, cachePrepStmts, rewriteBatchedStatements, result-set streaming with Integer.MIN_VALUE, and server-side cursors with useCursorFetch - with notes on how each interacts with Spring Batch's JdbcCursorItemReader.
+:toc:
+:idprefix:
+
+Batch jobs stress a JDBC driver differently from a web application. They run the same statement many times,
+insert or update rows in bulk, and read result sets that do not fit in memory.
+MySQL Connector/J has several connection options that change how it behaves in each of those situations,
+and most of them are off by default. This article walks through the options that matter most for batch work,
+what each one actually does on the wire, and the pitfalls to watch for when combining them.
+
+== Using Server-Side Prepared Statements
+
+PreparedStatement helps optimize repeated query execution.
+Instead of declaring the entire SQL string such as `SELECT * FROM CITY WHERE COUNTRY = 'KOREA' AND POPULATION > 10000`,
+it separates the static SQL structure `SELECT * FROM CITY WHERE COUNTRY = ? AND POPULATION > ?` from the dynamic parameters.
+
+When a query is executed repeatedly, the server reuses the parse tree built by parsing the SQL and executes it with different parameters.
+This reduces CPU and other resource usage on the server.
+If the JDBC driver sends only the varying parameters instead of transmitting the entire query for each execution, the amount of network traffic can also be reduced.
+Whether such optimizations actually occur depends on the DBMS and configuration options.
+
+MySQL provides the `useServerPrepStmts` option to control whether PreparedStatement optimization is performed on the server side.
+
+Since the default value is `false`, the JDBC driver sends the fully substituted SQL string to the server for every execution when no additional configuration is applied.
+This is referred to as *client-side PreparedStatement* or *emulated PreparedStatement*.
+This default behavior has the advantage of requiring only one network round-trip per query,
+but server-side optimizations are not applied.
+
+In environments such as typical web applications, where a variety of queries are executed,
+it may be more efficient to keep the default behavior while enabling `cachePrepStmts=true` and increasing related cache sizes. footnote:[For performance test cases combining `useServerPrepStmts` and `cachePrepStmts`, see the following articles:
+https://vladmihalcea.com/mysql-jdbc-statement-caching/ , https://tech.kakaopay.com/post/how-preparedstatement-works-in-our-apps/]
+
+Setting `useServerPrepStmts=true` enables PreparedStatement parsing on the server side.
+When a `PreparedStatement` object is created, the template query containing `?` placeholders is first sent to the server, parsed, and prepared.
+Each time `execute()` is called, only the parameter values are transmitted, and the already-prepared query is executed.
+If the same query is executed repeatedly, the parse tree built from SQL parsing is reused, improving performance and reducing network bandwidth.
+However, MySQL clears the optimization state once execution finishes and optimizes again on the next execution, so you cannot assume the execution plan is built only once and reused indefinitely. footnote:[The MySQL 8.4 manual describes what is cached for prepared statements as an internal structure converted from the SQL; for example, `SELECT *` is stored expanded into the actual column list. https://dev.mysql.com/doc/refman/8.4/en/statement-caching.html[]
+`Query_expression.clear_execution()` in the MySQL 8.4 source also resets the `optimized` state to `false` before a prepared statement is re-executed. https://dev.mysql.com/doc/dev/mysql-server/8.4.9/sql__lex_8h_source.html[]]
+On the other hand, since at least two network round-trips (prepare, execute) are required to execute a query, performance may actually degrade for queries that are executed only once.
+
+If your application repeatedly executes the same query in MySQL, the `useServerPrepStmts=true` option is worth trying out.
+However, MySQL parses quickly and rebuilds the execution plan on every execution, so the gain from this option may be small.
+In the two performance tests introduced in the footnote above, server-side prepared statements were not faster than client-side ones.
+When enabling this option, also enable `cachePrepStmts=true` so that the prepare request does not add a network round-trip on every execution, and measure performance with your actual batch job to decide whether to keep it.
+
+In MySQL versions prior to 5.1.17, using this option prevented queries from using the query cache, but from 5.1.17 onwards it can be used together with the query cache.
+Note that the query cache itself was deprecated in MySQL 5.7.20 and removed in 8.0, so this constraint no longer matters on 8.0 and later. footnote:[The deprecation and removal of the query cache is documented in the 'How the Query Cache Operates' section of the MySQL 5.7 Reference Manual: https://dev.mysql.com/doc/refman/5.7/en/query-cache-operation.html]
+In MariaDB 10.6 and later, additional optimizations reduce metadata retransmission when using `useServerPrepStmts=true`, resulting in even better performance. footnote:[This improvement is tracked in https://jira.mariadb.org/browse/MDEV-19237]
+
+== Improving Batch Update Performance
+
+When inserting or updating multiple rows, using the JDBC `Statement.executeBatch()` method can execute them faster than repeatedly calling `executeUpdate()` for single statements. MySQL can further optimize batch update performance by enabling the `rewriteBatchedStatements=true` option in the JDBC connection URL.
+
+Since the default value is `false`, it must be explicitly enabled.
+When enabled, the MySQL JDBC driver combines multiple individual queries into a single statement.
+For example, let’s look at inserting three rows with a batch update using the following INSERT query:
+
+[source,sql]
+.Single INSERT form
+----
+INSERT INTO access_log(access_date_time, ip, username) VALUES (?, ?, ?);
+----
+
+Without `rewriteBatchedStatements=true`, the driver executes the above statement three times.
+With the option enabled, the driver merges them into a single statement:
+
+[source,sql]
+.Merged INSERT form
+----
+INSERT INTO access_log(access_date_time, ip, username) VALUES
+  (?, ?, ?),
+  (?, ?, ?),
+  (?, ?, ?);
+----
+
+Since the server processes the merged INSERT as a single statement, one execution of that statement takes longer.
+In replicated environments, this can increase the burden of replication lag.
+
+Even when multi-value `VALUES` clauses are not possible, the driver still combines multiple INSERT or UPDATE statements separated by `;` into a single transmission when the batch contains four or more statements.
+Batches of three or fewer statements are executed one by one.
+The direct benefit of this mode is packing multiple SQL statements into one request to reduce network round-trips.
+Unlike the multi-value INSERT, which the server processes as a single statement, the `;`-combined form merely transmits several statements at once, so the parsing and execution of each statement are not merged into one.
+
+Be aware that `rewriteBatchedStatements=true` may conflict with other JDBC options or require additional tuning.
+The Connector/J documentation once stated that `rewriteBatchedStatements` was ignored when used together with `useServerPrepStmts=true`, or with `useCursorFetch=true` (introduced later in this document) which implicitly enables it.
+The 8.0.30 release notes corrected this as a documentation error. footnote:[The correction can be found in the following release notes: https://dev.mysql.com/doc/relnotes/connector-j/en/news-8-0-30.html]
+Query rewriting now applies as-is even when combined with server-side PreparedStatements.
+
+When combining queries, the driver calculates on its own how many statements to merge at once so that the combined statement stays within the `max_allowed_packet` limit.
+Therefore a small value usually does not cause an error; it just reduces how many statements are merged at once, shrinking the benefit of combining queries.
+To insert or update large volumes at once, it is better to set this value generously.
+
+`max_allowed_packet` can be set in the MySQL configuration file or as a global system variable.
+The session value is read-only and initialized from the global value when the connection is established, so if you change the global value dynamically, new connections use the changed value. footnote:[The `max_allowed_packet` entry in the MySQL 8.4 Reference Manual states that the global value can be changed dynamically but the session value is read-only. https://dev.mysql.com/doc/refman/8.4/en/server-system-variables.html#sysvar_max_allowed_packet[]]
+You can check it with: `SHOW VARIABLES LIKE 'max%';`
+Note that the `bulk_insert_buffer_size` setting is only referenced by the MyISAM engine—which is rarely used today—and can be ignored when using InnoDB.
+
+Due to such conflicts and interactions among options,
+it may be difficult to find a single DB configuration optimized for both reads and writes.
+Another possible approach is to declare separate data sources in the application for large-scale read and write operations.
+
+In Connector/J versions up to 8.0.28, inserting BLOB (Binary Large Object) values with a batch update could cause a `NullPointerException`, but this has been fixed in newer versions.
+footnote:[See release notes: https://dev.mysql.com/doc/relnotes/connector-j/en/news-8-0-29.html]
+
+== Options for Large-Scale Data Retrieval
+If an application using Spring Batch with MySQL executes queries through `JdbcCursorItemReader` with default settings, the entire result set will be fetched at once and loaded into the application's memory.
+When querying large datasets, this can cause Out Of Memory (OOM) errors.
+To avoid this, you must use ResultSet streaming or server-side cursors.
+
+=== Streaming Results One Row at a Time
+
+ResultSet streaming retrieves query results gradually instead of receiving them all at once.
+
+To use this approach, configure the PreparedStatement as follows:
+
+[source,java]
+.Creating PreparedStatement for streaming
+----
+PreparedStatement statement = con.prepareStatement(
+    sql,
+    ResultSet.TYPE_FORWARD_ONLY,
+    ResultSet.CONCUR_READ_ONLY
+);
+
+statement.setFetchSize(Integer.MIN_VALUE);
+----
+
+Note that calling `setFetchSize(Integer.MIN_VALUE)` is not technically valid per JDBC specification.
+The Javadoc for the java.sql.Statement interface states that if a value less than 0 is passed to the `setFetchSize(int)` method, it should throw a SQLException.
+However, since MySQL Connector/J enables streaming mode by passing `Integer.MIN_VALUE` to this method, developers have no choice but to use it that way.
+
+While the streaming mode reduces memory usage, it is not always advantageous.
+The query request is sent only once and the server pushes the entire result back as consecutive packets, so it does not incur one network round-trip per row. footnote:[The response structure, in which the server answers a single query request with one packet per row sent in sequence, is described in the following MySQL protocol documentation: https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_com_query_response_text_resultset.html]
+Instead, while the driver reads and processes the result one row at a time, server resources and locks are held until the query completes, so the slower the application consumes the rows, the longer this burden lasts.
+Other drawbacks are that you cannot directly control the size of each transfer, and no other queries can be executed on the same connection until the ResultSet is closed. footnote:[This is explained in the ResultSet section of the following Connector/J implementation notes. It describes the restriction that you must read all of the rows (or close the ResultSet) before issuing any other queries on the same connection, and introduces the `useCursorFetch` option as an alternative that fetches a set number of rows at a time. https://dev.mysql.com/doc/connector-j/en/connector-j-reference-implementation-notes.html]
+
+In Spring Batch, calling `JdbcCursorItemReader.setFetchSize(Integer.MIN_VALUE)` enables the streaming mode.
+`Statement` creation options such as `ResultSet.TYPE_FORWARD_ONLY` are applied internally within `JdbcCursorItemReader`.
+If the `JdbcCursorItemReader.verifyCursorPosition` property remains at its default `true`, it conflicts with `TYPE_FORWARD_ONLY` and produces the following error:
+
+[source]
+.Error caused by verifyCursorPosition=true
+----
+org.springframework.dao.TransientDataAccessResourceException: Attempt to process next row failed; SQL [SELECT * FROM access_log]; Operation not allowed for a result set of type ResultSet.TYPE_FORWARD_ONLY.
+----
+
+Accordingly, a `JdbcCursorItemReader` configured for per-row streaming should be created as follows:
+
+[source,java]
+.JdbcCursorItemReader for streaming queries in MySQL
+----
+return new JdbcCursorItemReaderBuilder<T>()
+  .name("streamingDbReader")
+  .dataSource(this.dataSource)
+  .sql(sql)
+  .rowMapper(rowMapper)
+  .fetchSize(Integer.MIN_VALUE)
+  .verifyCursorPosition(false)
+  .build();
+----
+
+=== Using Server-side Cursors
+MySQL server-side cursors work by storing results in a temporary table and allowing the client to fetch the data in configurable chunks.
+Supported in server versions newer than MySQL 5.0.2, they can be enabled by adding `useCursorFetch=true` to the JDBC URL. footnote:[The Connector/J documentation used to describe this property as determining whether cursor-based fetching should be used when the server version is newer than MySQL 5.0.2 and the fetch size is greater than 0. As the minimum supported server versions moved up, this version condition was dropped from recent documentation: https://dev.mysql.com/doc/connector-j/en/connector-j-connp-props-performance-extensions.html]
+Since the default value is `false`, this option must be explicitly enabled if client-side cursors are not desired.
+
+Even with `useCursorFetch=true`, server-side cursors will not be used unless a positive fetch size is specified.
+This can be configured per query using the `Statement.setFetchSize(int)` method in the JDBC API, or a default value can be set via the `defaultFetchSize` property in the JDBC connection URL. footnote:[See: https://dev.mysql.com/doc/connector-j/en/connector-j-connp-props-performance-extensions.html]
+
+In Spring Batch, the fetch size can be specified using `JdbcCursorItemReader.setFetchSize(int)`.
+It is recommended to set this value equal to chunk size in your step configuration.
+
+As mentioned earlier, enabling the `useCursorFetch=true` option also automatically enables `useServerPrepStmts=true`.
+
+
+== References
+
+* https://dev.mysql.com/doc/connector-j/en/connector-j-connp-props-performance-extensions.html[MySQL Connector/J Developer Guide: Performance Extensions]
+* https://dev.mysql.com/doc/connector-j/en/connector-j-reference-implementation-notes.html[MySQL Connector/J Developer Guide: JDBC API Implementation Notes]
+* https://dev.mysql.com/doc/refman/8.4/en/statement-caching.html[MySQL 8.4 Reference Manual: Caching of Prepared Statements and Stored Programs]
+* https://dev.mysql.com/doc/refman/8.4/en/server-system-variables.html#sysvar_max_allowed_packet[MySQL 8.4 Reference Manual: max_allowed_packet]
+* https://vladmihalcea.com/mysql-jdbc-statement-caching/[Vlad Mihalcea: MySQL JDBC Statement Caching]
+* https://docs.spring.io/spring-batch/reference/readers-and-writers/database.html#JdbcCursorItemReader[Spring Batch Reference: JdbcCursorItemReader]
+* https://gist.github.com/benelog/e7560ccf29c4365d939e9c3d210f9086[Original gist of this article]
