@@ -334,7 +334,3 @@ I recommend dividing suffixes by the object's role. The name then reveals the ro
 * Derek C. Ashmore, link:https://www.amazon.com/Java-Architects-Handbook-Second-applications/dp/0972954880[**The Java EE Architect's Handbook, Second Edition**], DVT Press, 2014, Chapter 5
 * https://www.oracle.com/java/technologies/transfer-object.html[Oracle: Core J2EE Patterns - Transfer Object]
 * http://www.adam-bien.com/roller/abien/entry/value_object_vs_data_transfer[Adam Bien: Value Object vs. Data Transfer Object (VO vs. DTO)]
-
-=== Related Talk
-
-* https://github.com/benelog/presentations/blob/main/20200507-entity-design/slides.md[Entity class design and persistence frameworks (talk, 2020, in Korean)]
