@@ -6,8 +6,9 @@ description: Writing guide for this English-language tech blog - post header fie
 # Blog Post Writing Guide
 
 Conventions for `src/content/*.adoc`. The site is served at https://tech.benelog.net/ for an English-speaking
-audience. Many articles are English rewrites of posts from the Korean blog https://blog.benelog.net/ ; when an
-article has a Korean original, link to it in the References section.
+audience. Many articles are English rewrites of posts from the Korean blog https://blog.benelog.net/ .
+Do not link to the Korean original and do not add a "translated from Korean" note; English readers gain
+nothing from them. Each article stands on its own.
 
 ## 1. Header
 
@@ -82,20 +83,9 @@ When claiming something is free or cheap, state the assumptions (traffic, free-t
 
 * https://example.com[Title or description]
 * link:other-post.html[Related post on this blog]
-* https://blog.benelog.net/slug.html[Korean original of this article]
 ```
 
 Group references in a two-level list only when there are many; a group with one item stays at the top level.
-
-### Attribution for AI-assisted writing
-
-If an AI tool helped write the post, add a rule and one line after the References section:
-
-```adoc
-'''
-
-This post was written by Sanghyuk Jung with help from Claude Code.
-```
 
 ### Reproduction steps for setup articles
 
@@ -191,6 +181,6 @@ Body text footnote:[Footnote text with a source URL.]
 - [ ] h2 and h3 are concrete noun phrases in Title Case
 - [ ] Every code block has a language and a title
 - [ ] Images are under `src/content/img/<topic-slug>/`
-- [ ] References section exists; Korean original linked if there is one
+- [ ] References section exists
 - [ ] Tags reuse existing ones
 - [ ] `./gradlew bake` succeeds and the post renders at `output/<slug>.html`

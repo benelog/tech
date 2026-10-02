@@ -338,11 +338,3 @@ I recommend dividing suffixes by the object's role. The name then reveals the ro
 === Related Talk
 
 * https://github.com/benelog/presentations/blob/main/20200507-entity-design/slides.md[Entity class design and persistence frameworks (talk, 2020, in Korean)]
-
-=== Korean Original
-
-* https://blog.benelog.net/vo-vs-dto.html[VO vs DTO: 정의와 용어 혼용의 역사 (Korean original of this article)]
-
-'''
-
-This post was translated from the Korean original by Sanghyuk Jung with help from Claude Code.

@@ -6,9 +6,9 @@
 This blog collects engineering notes by Sanghyuk Jung (benelog): things learned while building and operating
 backend systems, mostly around Java, databases, build tools, and developer productivity.
 
-Most articles started as internal notes or as posts on the Korean-language blog
+Most articles started as internal notes or as posts on my Korean-language blog
 https://blog.benelog.net/[개발수양록]. The pieces here are rewritten in English so that
-they can be shared with a wider audience. Where a Korean original exists, the article links to it.
+they can be shared with a wider audience.
 
 Comments run on GitHub Discussions, so a GitHub account is all you need to join the conversation.
 

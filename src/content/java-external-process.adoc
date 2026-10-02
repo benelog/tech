@@ -1071,8 +1071,3 @@ With JDK 25 on Linux, keeping the default `POSIX_SPAWN` is the safe choice.
 * https://www.infoworld.com/article/2157336/when-runtime-exec-won-t.html[When Runtime.exec() won't]: Michael Daconta's article from 2000
 * https://d2.naver.com/helloworld/1113548[Running external processes in Java (NAVER D2, 2015, in Korean)]: the memory problem with `fork()` and the background to the adoption of `vfork()` in JDK 7
 * link:{source-repo}[Example code for this article]
-* https://blog.benelog.net/java-external-process.html[Korean original of this article]
-
-'''
-
-This post was translated from the Korean original by Sanghyuk Jung with help from Claude Code.
