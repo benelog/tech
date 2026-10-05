@@ -1,4 +1,4 @@
-= Benelog Tech Notes
+= Benelog's Tech Net
 Engineering notes by Sanghyuk Jung, in English
 :toc:
 
