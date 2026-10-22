@@ -1,0 +1,266 @@
+= How Java Optimizes String Concatenation
+Sanghyuk Jung
+2026-10-22
+:jbake-type: post
+:jbake-status: published
+:jbake-tags: java, performance, code-review
+:description: How javac and the JDK runtime optimize String concatenation with + across versions: StringBuffer in JDK 1.4, StringBuilder in JDK 5, invokedynamic in JDK 9, and hidden classes in JDK 24, with bytecode checked on JDK 25.
+:idprefix:
+:toc:
+
+The compiler and the JVM optimize code that joins ``String``s with the `+` operator. Up to JDK 1.4, ``javac`` translated it at compile time into code that uses ``StringBuffer``. From JDK 5 through JDK 8, it used ``StringBuilder`` instead. Since JDK 9, ``javac`` emits an `invokedynamic` instruction by default, and the actual concatenation code is linked at run time. Knowing which cases are optimized automatically gives you a clear rule: keep using `+` outside loops, and write a ``StringBuilder`` yourself only when you accumulate a string inside a loop.
+
+The Java Language Specification defines the result and the evaluation order of string concatenation, but leaves the implementation to the compiler. The version boundaries in this article therefore refer to the default bytecode of the JDK ``javac`` and to the OpenJDK runtime implementation. footnote:[Even in the SE 25 edition, https://docs.oracle.com/javase/specs/jls/se25/html/jls-15.html#jls-15.18.1[JLS 15.18.1] only says that a compiler may use ``StringBuffer`` or a similar technique. ``StringBuilder`` and ``invokedynamic`` both count as such a similar technique.]
+
+== Concatenation of Compile-Time Constant Expressions
+
+A compile-time constant expression of type ``String`` is evaluated at compile time into a single string. That string is registered in the string pool and shared, as if ``String.intern()`` had been called on it. ``String.intern()`` returns the canonical reference in the string pool for a given content. The heap may hold several ``String`` instances with the same content, but the string pool registers only one representative instance per content, and the canonical reference points to that instance. Interning two strings with the same content therefore yields the same instance. This does not mean that every ``String`` object on the heap with the same content is merged into the pool automatically. Besides string literals, such constant expressions can include primitive literals and constant variables (for example, ``SIZE`` declared as `static final int SIZE = 10;`). footnote:[See https://docs.oracle.com/javase/specs/jls/se25/html/jls-15.html#jls-15.29[JLS 15.29] for the exact scope of compile-time constant expressions.] For example, the two declarations below compile to the same code.
+
+[source,java]
+.Two declarations that compile to the same constant
+----
+String str1 = "It's" + " a string" + "....";
+String str2 = "It's a string....";
+----
+
+This rule is the same in every JDK version this article covers. The JDK 25 bytecode shown later also has both variables load the same constant pool entry (`ldc #7`). Because the two variables refer to the same instance in the string pool, `str1 == str2` is ``true``, not just `equals()`. The result of a non-constant concatenation, on the other hand, is a new ``String`` that is not interned automatically. Comparing it with ``==`` against a literal or a separately created string with the same content gives ``false``.
+
+== StringBuffer and StringBuilder for Concatenation with Variables
+
+When you compile an expression that mixes constants and `String` variables with ``javac`` up to JDK 8, it becomes calls to the `append()` and `toString()` methods of ``StringBuffer`` or ``StringBuilder``. The JDK 1.4 ``javac`` used ``StringBuffer``. The https://docs.oracle.com/javame/config/cldc/ref-impl/cldc1.1/jsr139/java/lang/StringBuffer.html[StringBuffer javadoc of CLDC 1.1], a Java ME document from the same period, describes how compilers of that time translated the operator.
+
+[quote]
+____
+String buffers are used by the compiler to implement the binary string concatenation operator. For example, the code:
+x = "a" + 4 + "c"
+is compiled to the equivalent of:
+x = new StringBuffer().append("a").append(4).append("c").toString()
+which creates a new string buffer (initially empty), appends the string representation of each operand to the string buffer in turn, and then converts the contents of the string buffer to a string. Overall, this avoids creating many temporary strings.
+____
+
+From JDK 5 through JDK 8, ``javac`` uses ``StringBuilder`` instead of ``StringBuffer``. The methods of ``StringBuilder`` are not `synchronized`, so each `append()` call does not take a lock. You can confirm this in the bytecode or in decompiled output. Take the following source.
+
+[source,java]
+.Source with constant and variable concatenation
+----
+String str0 = "It's a string....";
+String str1 = "It's" + " a string" + "....";
+String str2 = "It's a string...." + str0 + "000";
+str2 = str0 + str1 + "1111" ;
+str2 = str2 + "1111";
+str2 += "1111";
+for (int i=0;i<10;i++){
+    str2 = str2 + "1111";
+    str2 += "1111";
+}
+----
+
+Compiling it with ``javac`` from JDK 5 to JDK 8 and decompiling the class gives the following result.
+
+[source,java]
+.Decompiled output of a class compiled with javac from JDK 5 to JDK 8
+----
+String str0 = "It's a string....";
+String str1 = "It's a string....";
+String str2 = (new StringBuilder("It's a string....")).append(str0).append("000").toString();
+str2 = (new StringBuilder(String.valueOf(str0))).append(str1).append("1111").toString();
+str2 = (new StringBuilder(String.valueOf(str2))).append("1111").toString();
+str2 = (new StringBuilder(String.valueOf(str2))).append("1111").toString();
+for(int i = 0; i < 10; i++) {
+    str2 = (new StringBuilder(String.valueOf(str2))).append("1111").toString();
+    str2 = (new StringBuilder(String.valueOf(str2))).append("1111").toString();
+}
+----
+
+[NOTE]
+====
+Depending on its options, a decompiler may reconstruct something close to the original source, so the `+` operators appear unchanged. The https://www.benf.org/other/cfr/stringbuilder-vs-concatenation.html[CFR] decompiler is one example. The `javap -c` command shows the bytecode accurately.
+====
+
+== String Concatenation Accumulated in a Loop
+
+The loop is the part of the decompiled output that deserves attention. The bytecode creates a new ``StringBuilder`` on every iteration and calls ``toString()`` to produce the ``String`` passed to the next iteration. The HotSpot C2 JIT compiler has the `OptimizeStringConcat` optimization, enabled by default, which recognizes chains of `append()` and `toString()` calls and can eliminate the heap allocation of this temporary ``StringBuilder``. The number of `new` instructions in the bytecode is therefore not always the number of objects actually allocated. The other problem remains, though: each iteration copies the ever-growing previous result into the new one.
+
+So when a performance-sensitive loop accumulates many strings, use a single ``StringBuilder`` directly instead of `+`. If you append a fixed-length string repeatedly, the total amount copied by the `+` approach grows with the square of the iteration count, while ``StringBuilder`` reuses its internal buffer. With a small count such as 100 iterations, the difference is small (see the measurements below), so you can pick whichever reads better. footnote:[For another performance test, see https://pellegrino.link/2015/08/22/string-concatenation-with-java-8.html[String concatenation with Java 8].]
+
+[source,java]
+.Accumulating with a single StringBuilder
+----
+StringBuilder sb = new StringBuilder(str2);
+for (int i = 0; i < 10; i++) {
+    sb.append("1111");
+}
+str2 = sb.toString();
+----
+
+I measured the difference between the two approaches on JDK 25 (Temurin 25+36). The code appends a 4-character string n times. After 200 warm-up runs for the JIT, I ran each condition 20 times (5 times for 100,000 iterations) and recorded the shortest time. The benchmark code is in https://github.com/benelog/blog/tree/main/examples/string-concat[examples/string-concat]. footnote:[This is a simple `System.nanoTime()` measurement without JMH, so the small numbers may be inaccurate. From 10,000 iterations on, the gap is several hundred times or more, so the conclusion does not change.]
+
+[cols="1,1,1,1", options="header"]
+|===
+|Iterations |`+` concatenation |``StringBuilder`` used directly |Ratio
+
+|100
+|0.008ms
+|0.001ms
+|about 10x
+
+|1,000
+|0.53ms
+|0.009ms
+|about 56x
+
+|10,000
+|10.6ms
+|0.023ms
+|about 471x
+
+|100,000
+|1,485ms
+|0.22ms
+|about 6,667x
+|===
+
+Each time the iteration count grew tenfold, the `+` time grew by about 66, 20, and 140 times, while the ``StringBuilder`` time grew by 10 times or less. If the total copy volume is proportional to the square of the iteration count, the time should grow 100 times per tenfold step. The measurements fluctuate because of the JIT and GC, but they follow the trend described above. At 100 iterations, both approaches finish in under 0.01ms, so the difference is hard to notice.
+
+== The invokedynamic Approach Since JDK 9
+
+Starting with JDK 9, https://openjdk.org/jeps/280[JEP 280: Indify String Concatenation] changed the default translation of ``javac`` completely. Instead of generating `StringBuilder` calls, the compiler leaves an `invokedynamic` call site, and the actual concatenation method is linked at run time.
+
+=== How invokedynamic Works
+
+``invokedynamic`` is a bytecode instruction that decides which method to call at run time. Other invocation instructions such as ``invokevirtual`` and `invokestatic` have their targets fixed in the class file. ``invokedynamic`` instead delegates the decision of which method a call site links to, to Java code at run time. It was added in JDK 7 through https://jcp.org/en/jsr/detail?id=292[JSR 292] to support dynamic languages on the JVM, and JDK 8 also uses it to implement lambda expressions.
+
+The code that performs this linking is the bootstrap method. The class file records the bootstrap method for each `invokedynamic` call site. Before a call site runs for the first time, the JVM calls its bootstrap method to link it, and the bootstrap method returns a ``CallSite`` that points to the method to execute. If several threads run the same call site for the first time concurrently, the bootstrap method may be invoked concurrently, but the JVM installs only one of the results in the call site. For string concatenation, the bootstrap method is ``StringConcatFactory.makeConcatWithConstants()``, which builds the concatenation code and returns it wrapped in a ``CallSite``.
+
+A ``MethodHandle``, in the `java.lang.invoke` package, is a reference to something to execute. It can point to a method, a constructor call, or a field access, and its argument and return types are held in a ``MethodType`` object. It serves a purpose similar to a reflective ``Method``, but it checks access only once, when the ``MethodHandle`` is created, and it is called directly through methods such as `invokeExact()`. Methods such as `MethodHandles.filterArguments()` and `MethodHandles.foldArguments()` can also combine several ``MethodHandle``s into a new one. Among the concatenation strategies described later, the three whose names start with ``MH`` build the concatenation code with this combinator feature.
+
+A ``CallSite``, from the same package, holds a single ``MethodHandle`` for the method to run in a property called the target. `CallSite.getTarget()` returns the current target ``MethodHandle``. The JVM attaches the ``CallSite`` returned by the bootstrap method to the call site; this is called linking. Once linked, executing `invokedynamic` is equivalent to invoking the target ``MethodHandle`` at that moment. Some implementations, such as ``MutableCallSite``, can switch the target to another ``MethodHandle`` while the program runs, but string concatenation uses ``ConstantCallSite``, whose target never changes. After linking, the call site behaves like an ordinary method call and the JIT compiler can inline it.
+
+=== invokedynamic Bytecode Checked on JDK 25
+
+I compiled the following source with JDK 25.
+
+[source,java]
+.Body of an instance method in StringTest.java
+----
+String str0 = "It's a string....";
+String str1 = "It's" + " a string" + "....";
+String str2 = str0 + str1 + "1111";
+for (int i = 0; i < 10; i++) {
+    str2 = str2 + "1111";
+}
+----
+
+The bytecode shown by `javap -c StringTest` contains `invokedynamic` instructions instead of `StringBuilder` calls.
+
+[source,text]
+.The method in the javap -c StringTest output (compiled with JDK 25)
+----
+ 0: ldc           #7    // String It's a string....
+ 2: astore_1
+ 3: ldc           #7    // String It's a string....
+ 5: astore_2
+ 6: aload_1
+ 7: aload_2
+ 8: invokedynamic #9,  0  // InvokeDynamic #0:makeConcatWithConstants:(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;
+13: astore_3
+14: iconst_0
+15: istore        4
+17: iload         4
+19: bipush        10
+21: if_icmpge     37
+24: aload_3
+25: invokedynamic #13,  0 // InvokeDynamic #1:makeConcatWithConstants:(Ljava/lang/String;)Ljava/lang/String;
+30: astore_3
+31: iinc          4, 1
+34: goto          17
+37: return
+----
+
+Compiling the same source with `javac --release 8` produces the same `StringBuilder` calls seen in the decompiled output of the previous section.
+
+The advantage of this approach is that the concatenation strategy lives in the JDK runtime, not in the compiled class file. The class file keeps only a recipe string that lists argument slots and constants. For example, ``str0 + str1 + "1111"`` above becomes a recipe of two `\u0001` characters, each marking an argument slot, followed by ``1111``. You can see it under `BootstrapMethods` in the `javap -v` output. A class compiled once therefore picks up the concatenation strategy of a newer runtime when you upgrade the JDK it runs on, without recompiling. A class compiled with JDK 11 and run on JDK 25 uses the hidden class-based general path introduced in JDK 24. https://dzone.com/articles/jdk-9jep-280-string-concatenations-will-never-be-t[JDK 9/JEP 280: String Concatenations Will Never Be the Same] explains the background in more detail.
+
+=== Changes in StringConcatFactory Strategies
+
+``StringConcatFactory`` in JDK 9 had six concatenation strategies, selectable with the `java.lang.invoke.stringConcat` system property. In the strategy names, ``BC`` means bytecode generation at run time, ``MH`` means ``MethodHandle`` combination, ``SB`` means use of ``StringBuilder``, ``SIZED`` means an estimated initial buffer capacity, and ``SIZED_EXACT`` means an exactly computed capacity.
+
+[cols="1,3", options="header"]
+|===
+|Strategy |Description
+
+|`BC_SB`
+|Generates, at run time, the bytecode of a class that calls ``StringBuilder``. The code has the same shape as what ``javac`` up to JDK 8 produced at compile time.
+
+|`BC_SB_SIZED`
+|Same as ``BC_SB``, but sets the initial capacity of ``StringBuilder`` to an estimate to reduce growth of the internal buffer.
+
+|`BC_SB_SIZED_EXACT`
+|Computes the lengths of the arguments in advance and sets the initial capacity of ``StringBuilder`` to the exact value.
+
+|`MH_SB_SIZED`
+|Builds the ``StringBuilder`` calls by combining ``MethodHandle``s instead of generating bytecode. The initial capacity is an estimate.
+
+|`MH_SB_SIZED_EXACT`
+|Same approach as ``MH_SB_SIZED``, but computes the initial capacity exactly.
+
+|`MH_INLINE_SIZED_EXACT`
+|The default strategy. Skips ``StringBuilder``, creates a `byte` array of the final length, and writes the arguments straight into it.
+|===
+
+The default strategy, ``MH_INLINE_SIZED_EXACT``, creates the ``String`` from the filled `byte` array without an extra copy, so it produces the fewest temporary objects and copies. The `generateMHInlineCopy()` method in https://github.com/openjdk/jdk/blob/34c79640e76c001e9f316f9aaba49dbe227bbae7/src/java.base/share/classes/java/lang/invoke/StringConcatFactory.java#L448[StringConcatFactory.java] implements it. Simple forms, such as adding two reference values, also use special paths like `simpleConcat()` in https://github.com/openjdk/jdk/blob/34c79640e76c001e9f316f9aaba49dbe227bbae7/src/java.base/share/classes/java/lang/StringConcatHelper.java#L406-L427[StringConcatHelper.java].
+
+The five non-default strategies and the `java.lang.invoke.stringConcat` property were removed in JDK 15 by https://bugs.openjdk.org/browse/JDK-8245455[JDK-8245455]. In this article, I call the path that most concatenations take by default the general path, excluding fast paths dedicated to special forms such as `simpleConcat()`. From JDK 15 through JDK 22, the general path is the inline-copy MethodHandle approach that descends from ``MH_INLINE_SIZED_EXACT``. It combines several ``MethodHandle``s into a concatenation method that creates a `byte` array of the exact final length and copies each argument straight into it, with no intermediate buffer (inline copy).
+
+JDK 23 added, through https://bugs.openjdk.org/browse/JDK-8327247[JDK-8327247], a path that generates bytecode calling ``StringBuilder`` for concatenations whose argument count exceeds the default threshold of 20. With many arguments, the MethodHandle expression tree grew large, and in extreme cases the C2 compiler used up to 2GB of memory to compile it. The change avoids that problem.
+
+In JDK 24, https://bugs.openjdk.org/browse/JDK-8336856[JDK-8336856] changed the main general path again, this time to generating a hidden class per argument shape.
+
+Hidden classes are special classes added in JDK 15 by https://openjdk.org/jeps/371[JEP 371: Hidden Classes]. They are defined with `Lookup.defineHiddenClass()`, cannot be found by class name, and can be unloaded individually once no longer referenced. This makes them a good fit for code that frameworks or the JDK generate at run time. Since JDK 15, the implementation classes of lambda expressions are also hidden classes. In the JDK 25 implementation, the argument shape that serves as the key of the hidden class cache is a ``MethodType`` made of the number of dynamic arguments and their normalized types. Reference types are normalized to ``Object``, and ``byte`` and ``short`` to ``int``. The contents and positions of constants are not part of the cache key; each call site stores them in its own ``String[]``. So in the bytecode above, the call site for ``str0 + str1 + "1111"`` has the signature ``(String, String) → String``, but the cache uses the shape `(Object, Object) → String`. The call site for ``str2 + "1111"`` inside the loop uses the shape `(Object) → String`, so the two call sites have different shapes. With hidden classes per argument shape, a generated concatenation class can be cached and reused by other call sites of the same shape. The cache uses soft references, so if a cached class is reclaimed, a class for the same shape may be generated again. Because the result is plain bytecode that the JIT compiler handles easily, instead of a deeply nested ``MethodHandle`` tree, linking and warmup costs go down.
+
+``StringConcatFactory`` in JDK 25 first checks for a fast path for simple concatenations and handles everything else with ``InlineHiddenClassStrategy`` by default. This strategy uses a prebuilt dedicated handler when there is a single dynamic argument and a hidden class per argument shape for the other general cases. The concatenation code fills a `byte` array of the final size and creates a ``String`` from that array. You can confirm this in https://github.com/openjdk/jdk/blob/jdk-25%2B36/src/java.base/share/classes/java/lang/invoke/StringConcatFactory.java[StringConcatFactory.java in JDK 25].
+
+As the bytecode above shows, the `invokedynamic` instruction inside the loop calls the already linked concatenation method on every iteration and creates a new result ``String``. The bootstrap method of ``StringConcatFactory`` does not run again each time. Neither the compiler nor the runtime hoists a single accumulating ``StringBuilder`` out of the loop, so the advice to use a ``StringBuilder`` directly in loops that accumulate many strings still holds after JDK 9.
+
+== Summary
+
+[cols="1,3", options="header"]
+|===
+|JDK version |How `+` concatenation is handled
+
+|Up to JDK 1.4
+|``javac`` translates it at compile time into ``StringBuffer`` `append()` and `toString()` calls
+
+|JDK 5 to 8
+|``javac`` translates it at compile time into calls to the unsynchronized ``StringBuilder``
+
+|JDK 9 to 14
+|``javac`` emits an ``invokedynamic`` call site. On first linking, ``StringConcatFactory`` links a concatenation method, with a choice of six strategies
+
+|JDK 15 to 22
+|The alternative strategies are removed, and the inline-copy MethodHandle approach is the general path
+
+|JDK 23
+|Concatenations with many arguments use a path that generates bytecode calling ``StringBuilder``
+
+|JDK 24 and 25
+|A fast path for simple concatenations, a dedicated implementation for a single argument, and a general path based on hidden classes per normalized argument shape
+|===
+
+Folding a compile-time constant expression of type ``String`` into a single constant works the same in every version. Code that adds one or two strings outside a loop can be optimized by ``javac`` and the JDK runtime, so keep the more readable `+` operator there. Neither the compiler nor the runtime turns a loop into a single accumulating ``StringBuilder``, though. If a loop accumulates strings over 1,000 or more iterations, use a ``StringBuilder`` directly. In the measurements above, the gap was about 56 times at 1,000 iterations and about 471 times at 10,000.
+
+== References
+
+* https://docs.oracle.com/javame/config/cldc/ref-impl/cldc1.1/jsr139/java/lang/StringBuffer.html[CLDC 1.1 StringBuffer javadoc]
+* https://docs.oracle.com/javase/specs/jls/se25/html/jls-15.html#jls-15.18.1[JLS 15.18.1: String Concatenation Operator +]
+* https://docs.oracle.com/javase/specs/jls/se25/html/jls-15.html#jls-15.29[JLS 15.29: Constant Expressions]
+* https://jcp.org/en/jsr/detail?id=292[JSR 292: Supporting Dynamically Typed Languages on the Java Platform]
+* https://openjdk.org/jeps/280[JEP 280: Indify String Concatenation]
+* https://openjdk.org/jeps/371[JEP 371: Hidden Classes]
+* https://dzone.com/articles/jdk-9jep-280-string-concatenations-will-never-be-t[JDK 9/JEP 280: String Concatenations Will Never Be the Same]
+* https://bugs.openjdk.org/browse/JDK-8245455[JDK-8245455: Remove alternative StringConcatFactory strategies]
+* https://bugs.openjdk.org/browse/JDK-8327247[JDK-8327247: C2 uses up to 2GB of RAM to compile complex string concat in extreme cases]
+* https://bugs.openjdk.org/browse/JDK-8336856[JDK-8336856: Efficient hidden class-based string concatenation strategy]
+* https://github.com/openjdk/jdk/blob/jdk-25%2B36/src/java.base/share/classes/java/lang/invoke/StringConcatFactory.java[JDK 25 StringConcatFactory.java]
+* https://pellegrino.link/2015/08/22/string-concatenation-with-java-8.html[String concatenation with Java 8]
+* https://www.benf.org/other/cfr/stringbuilder-vs-concatenation.html[CFR: StringBuilder vs concatenation]
