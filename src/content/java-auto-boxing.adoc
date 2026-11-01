@@ -1,0 +1,417 @@
+= Java Autoboxing: How It Compiles and How the Integer Cache Works
+Sanghyuk Jung
+2026-11-01
+:jbake-type: post
+:jbake-status: published
+:jbake-tags: java, performance, code-review
+:description: How javac compiles autoboxing into Integer.valueOf() and intValue() calls, checked in JDK 25 bytecode, plus the -128 to 127 IntegerCache, JLS 5.1.7, -XX:AutoBoxCacheMax, boxing costs in loops, and what changed from JDK 5 to JDK 25.
+:idprefix:
+:toc:
+
+When you mix `int` and `java.lang.Integer`, the JDK's `javac` inserts the boxing and unboxing code for you. Knowing which method calls that code turns into lets you predict the result of an `==` comparison and the cost of creating objects in a loop.
+
+The way `javac` translates boxing has not changed since autoboxing arrived in JDK 5, but the cache implementation and the deprecation status of the wrapper constructors have changed from version to version. I checked the bytecode and the run results in this article on JDK 25 (Temurin 25+36).
+
+== Bytecode Generated for Boxing and Unboxing
+
+The code below assigns between `int` and `Integer` in both directions and compares them with `==`.
+
+[source,java]
+.Boxing.java
+----
+public class Boxing {
+    public static void main(String[] args) {
+        int a = 1;
+        Integer b = 1;
+        int c = b;
+        System.out.println(a == b);
+        System.out.println(a == c);
+    }
+}
+----
+
+Running `javap -c Boxing.class` with the `javap` tool included in the JDK prints the following bytecode.
+
+[source,text]
+.javap -c Boxing.class
+----
+  public static void main(java.lang.String[]);
+    Code:
+         0: iconst_1
+         1: istore_1
+         2: iconst_1
+         3: invokestatic  #7    // Method java/lang/Integer.valueOf:(I)Ljava/lang/Integer;
+         6: astore_2
+         7: aload_2
+         8: invokevirtual #13   // Method java/lang/Integer.intValue:()I
+        11: istore_3
+        12: getstatic     #17   // Field java/lang/System.out:Ljava/io/PrintStream;
+        15: iload_1
+        16: aload_2
+        17: invokevirtual #13   // Method java/lang/Integer.intValue:()I
+        20: if_icmpne     27
+        ...
+----
+
+There is no bytecode instruction dedicated to boxing or unboxing. The JDK's `javac` compiles a conversion from `int` to `Integer` into a call to `Integer.valueOf()`, and a conversion from `Integer` to `int` into a call to `intValue()`.
+
+When one side of `==` is an `int` and the other is an `Integer`, as in `a == b`, the `Integer` side is unboxed and the comparison is by value (`if_icmpne`). When both sides are `Integer`, no unboxing happens and the comparison is by reference (`if_acmpne`), so the result depends on the cache range covered in the next section.
+
+Decompiling shows the result of the conversion as Java code. However, modern decompilers restore `valueOf()` and `intValue()` calls to autoboxing syntax and show code almost identical to the source. In https://www.benf.org/other/cfr/[CFR], the `--sugarboxing false` option turns off this restoration and shows the method calls as they are.
+
+[source,java]
+.java -jar cfr-0.152.jar --sugarboxing false Boxing.class
+----
+public class Boxing {
+    public static void main(String[] stringArray) {
+        int n = 1;
+        Integer n2 = Integer.valueOf((int)1);
+        int n3 = n2.intValue();
+        System.out.println((n == n2.intValue() ? 1 : 0) != 0);
+        System.out.println((n == n3 ? 1 : 0) != 0);
+    }
+}
+----
+
+The casts that were not in the source, such as `(int)` in `Integer.valueOf((int)1)`, and expressions such as `+(... ? 1 : 0) != 0+` come from the decompiler. Bytecode has no instructions that operate only on boolean values, so `javac` produces the result of a comparison with an `if_icmpne` branch and the integers 0 and 1. The decompiler carries that flow over and shows it in this form. The lines to look at are the two assignments. `Integer n2` receives the return value of `Integer.valueOf()`, and `int n3` receives the return value of `intValue()`.
+
+Without the `--sugarboxing` option, the output matches the original source apart from the variable names, as shown below. Decompiled output alone therefore cannot tell you the cost of boxing.
+
+[source,java]
+.java -jar cfr-0.152.jar Boxing.class
+----
+public class Boxing {
+    public static void main(String[] stringArray) {
+        int n = 1;
+        Integer n2 = 1;
+        int n3 = n2;
+        System.out.println(n == n2);
+        System.out.println(n == n3);
+    }
+}
+----
+
+== Integer.valueOf() Cache and Reference Comparison
+
+The `new Integer(int)` constructor creates a new object every time, but `Integer.valueOf()` can reuse cached instances. In JDK 25, `java.lang.Integer` keeps the instances from -128 to 127 in `IntegerCache`.
+
+[source,java]
+.java/lang/Integer.java (JDK 25)
+----
+    private static final class IntegerCache {
+        static final int low = -128;
+        static final int high;
+
+        @Stable
+        static final Integer[] cache;
+        static Integer[] archivedCache;
+
+        static {
+            // high value may be configured by property
+            int h = 127;
+            String integerCacheHighPropValue =
+                VM.getSavedProperty("java.lang.Integer.IntegerCache.high");
+            ...
+        }
+    }
+
+    public static Integer valueOf(int i) {
+        if (i >= IntegerCache.low && i <= IntegerCache.high)
+            return IntegerCache.cache[i + (-IntegerCache.low)];
+        return new Integer(i);
+    }
+----
+
+The default upper bound of the cache is 127, and it can be raised through a saved property that the VM keeps separately. When a CDS (Class Data Sharing) archive is available, the archived array is loaded. If there is no archive, or the archive is smaller than the requested cache size, the whole cache or the missing part is built at run time.
+
+The Java Language Specification (JLS) does not require an implementation called `IntegerCache`. https://docs.oracle.com/javase/specs/jls/se25/html/jls-5.html#jls-5.1.7[JLS 5.1.7] specifies that when the value being boxed comes from a constant expression, the results of two boxing conversions must be the same reference under the conditions below. The JDK meets this requirement with the cache. Separately, the https://docs.oracle.com/en/java/javase/25/docs/api/java.base/java/lang/Integer.html#valueOf(int)[API contract of `Integer.valueOf(int)`] guarantees that -128 to 127 are always cached, whether or not the argument is a constant expression.
+
+[quote, Java Language Specification, 5.1.7. Boxing Conversion]
+____
+If the value `p` being boxed is the result of evaluating a constant expression of type `boolean`, `byte`, `char`, `short`, `int`, or `long`, and the result is `true`, `false`, a character in the range `'\u0000'` to `'\u007f'` inclusive, or an integer in the range `-128` to `127` inclusive, then let `a` and `b` be the results of any two boxing conversions of `p`. It is always the case that `a == b`.
+____
+
+Because of the cache range, the result of the code below depends on the size of the value.
+
+[source,java]
+.Identity.java
+----
+public class Identity {
+    public static void main(String[] args) {
+        Integer a = 127;
+        Integer b = 127;
+        Integer c = 128;
+        Integer d = 128;
+        System.out.println("a == b : " + (a == b));
+        System.out.println("c == d : " + (c == d));
+        System.out.println("c.equals(d) : " + c.equals(d));
+    }
+}
+----
+
+[source,text]
+.Output of Identity
+----
+a == b : true
+c == d : false
+c.equals(d) : true
+----
+
+With the default settings, 128 is outside the cache range, so each boxing creates a new `Integer`. That makes `c == d` `false`. This is why boxed types must be compared with `equals()` rather than `==`.
+
+The cache range differs by type. As of JDK 25, `Long`, `Short`, and `Byte` cache -128 to 127, and `Character` caches `'\u0000'` through `'\u007f'`. `Boolean` reuses `Boolean.TRUE` and `Boolean.FALSE`.
+
+=== Adjusting the Cache Range with -XX:AutoBoxCacheMax
+
+For `Integer`, the HotSpot option `-XX:AutoBoxCacheMax=<max>` raises the upper bound of the cache. This option is available in HotSpot builds that include the C2 compiler. Running the earlier example again with the same class file changes the result.
+
+[source,shell]
+.Running Identity with and without -XX:AutoBoxCacheMax
+----
+$ java Identity
+a == b : true
+c == d : false
+c.equals(d) : true
+
+$ java -XX:AutoBoxCacheMax=1000 Identity
+a == b : true
+c == d : true
+c.equals(d) : true
+----
+
+The same code gives a different `==` result depending on a runtime option, which is another reason not to compare boxed types with `==`. This option applies only to `Integer` and has no effect on `Long` or `Short`.
+
+In the OpenJDK implementation, `-Djava.lang.Integer.IntegerCache.high=<max>` has the same effect, but this value is a saved property kept by the VM, not a public system property that `System.getProperty()` can read. It is therefore safer to use the `-XX:AutoBoxCacheMax` option than to depend on this name. If you specify both, the VM overwrites this property with the `-XX:AutoBoxCacheMax` value, so the `-XX` option wins.
+
+== Wrapper Constructors Deprecated Since JDK 9
+
+`new Integer(int)` has carried `@Deprecated` since JDK 9. Before that, `javac` did not warn about this code. You could find it only with a static analyzer such as https://findbugs.sourceforge.net/[FindBugs] or with IntelliJ IDEA inspections. With the FindBugs plugin installed in Eclipse, the Problems view showed a warning like the following.
+
+[source,text]
+.FindBugs warning in the Eclipse Problems view
+----
+M P Bx: Method study.Test.testInteger() invokes inefficient new Integer(int) constructor;
+        use Integer.valueOf(int) instead
+----
+
+Today `javac` tells you itself. With the `-Xlint:deprecation` option, it also reports the location.
+
+[source,shell]
+.javac warnings with -Xlint:deprecation
+----
+$ javac -Xlint:deprecation OldStyle.java
+OldStyle.java:3: warning: [deprecation] Integer(int) in Integer has been deprecated
+        Integer c = new Integer(1);
+                    ^
+OldStyle.java:4: warning: [deprecation] Double(double) in Double has been deprecated
+        Double d = new Double(1.0);
+                   ^
+2 warnings
+----
+
+The JDK 25 source carries `@Deprecated(since="9")`. There is no `forRemoval`, so this API is not scheduled for removal, but there is no reason to use it in new code.
+
+[source,java]
+.java/lang/Integer.java (JDK 25)
+----
+    /**
+     * @deprecated
+     * It is rarely appropriate to use this constructor. The static factory
+     * {@link #valueOf(int)} is generally a better choice, as it is
+     * likely to yield significantly better space and time performance.
+     */
+    @Deprecated(since="9")
+    public Integer(int value) {
+----
+
+https://spotbugs.github.io/[SpotBugs], the successor to FindBugs, keeps the same rule as `DM_NUMBER_CTOR`. Its description is almost the same as in the FindBugs days.
+
+[quote, SpotBugs, "DM_NUMBER_CTOR: Method invokes inefficient Number constructor; use static valueOf instead"]
+____
+Using `new Integer(int)` is guaranteed to always result in a new object whereas `Integer.valueOf(int)` allows caching of values to be done by the compiler, class library, or JVM. Using of cached values avoids object allocation and the code will be faster.
+
+Values between -128 and 127 are guaranteed to have corresponding cached instances and using `valueOf` is approximately 3.5 times faster than using constructor. For values outside the constant range the performance of both styles is the same.
+
+Unless the class must be compatible with JVMs predating Java 5, use either autoboxing or the `valueOf()` method when creating instances of `Long`, `Integer`, `Short`, `Character`, and `Byte`.
+____
+
+However, the figure of "approximately 3.5 times" in the quote and the statement that performance is the same outside the cache range are not guarantees of the Java API. The actual difference can vary with an extended cache range, just-in-time (JIT) optimization, and the runtime environment.
+
+Built-in IDE checks can also find this code. In Eclipse, the "Deprecated API" item under "Deprecated and restricted API" in Java > Compiler > Errors/Warnings defaults to Warning, so Eclipse shows deprecation warnings without a plugin. IntelliJ IDEA has the inspection "Number constructor call with primitive argument" (`CachedNumberConstructorCall`) in the Java > Numeric issues group. It finds code that passes a primitive value to a `Long`, `Integer`, `Short`, or `Byte` constructor and suggests replacing it with `valueOf()`. By default the option "Report only when constructor is @Deprecated" is on, so it reports only on JDK 9 and later, where the constructors are deprecated.
+
+== Cost of Boxed Types in Loops
+
+Once you know that boxing and unboxing compile to method calls, you can also predict what happens when a boxed type is the accumulator in a loop. The following example is adapted to this article's measurement code from Item 6 of _Effective Java_, 3rd edition, "Avoid creating unnecessary objects."
+
+[source,java]
+.Boxed accumulator in a loop
+----
+static long boxed() {
+    Long sum = 0L;
+    for (long i = 0; i < Integer.MAX_VALUE; i++) {
+        sum += i;
+    }
+    return sum;
+}
+----
+
+The single line `sum += i` compiles to code that goes through both unboxing and boxing. Decompiling shows that this line has turned into `longValue()` and `Long.valueOf()` calls.
+
+[source,java]
+.java -jar cfr-0.152.jar --sugarboxing false SumTest.class
+----
+    static long boxed() {
+        Long l = Long.valueOf((long)0L);
+        for (long i = 0L; i < Integer.MAX_VALUE; ++i) {
+            l = Long.valueOf((long)(l.longValue() + i));
+        }
+        return l.longValue();
+    }
+----
+
+The bytecode shows the same flow.
+
+[source,text]
+.javap -c SumTest.class
+----
+  static long boxed();
+    Code:
+         0: lconst_0
+         1: invokestatic  #7    // Method java/lang/Long.valueOf:(J)Ljava/lang/Long;
+         4: astore_0
+         5: lconst_0
+         6: lstore_1
+         7: lload_1
+         8: ldc2_w        #15   // long 2147483647l
+        11: lcmp
+        12: ifge          32
+        15: aload_0
+        16: invokevirtual #17   // Method java/lang/Long.longValue:()J
+        19: lload_1
+        20: ladd
+        21: invokestatic  #7    // Method java/lang/Long.valueOf:(J)Ljava/lang/Long;
+        24: astore_0
+        25: lload_1
+        26: lconst_1
+        27: ladd
+        28: lstore_1
+        29: goto          7
+----
+
+Each iteration extracts the value with `longValue()`, adds to it, and boxes the result again with `Long.valueOf()`. Once the accumulated value exceeds 127, `Long.valueOf()` returns a new `Long` instance. The actual object allocation may still be removed by JIT optimization.
+
+Changing only the accumulator's type to `long` removes the boxing. I ran a program that times each version once three times on JDK 25, and the difference was about tenfold.
+
+[source,text]
+.Three runs on JDK 25
+----
+Long: 5122 ms, long: 507 ms
+Long: 4987 ms, long: 516 ms
+Long: 4919 ms, long: 513 ms
+----
+
+These values come from single `System.nanoTime()` measurements in each run, not from a benchmark tool such as JMH (Java Microbenchmark Harness), so the absolute numbers should not be taken at face value.
+
+== Double and Float Without a Cache
+
+Unlike the integer types, `Double` and `Float` have no cache. JLS 5.1.7 does not require reference identity for `float` and `double` either. In JDK 25, `Double.valueOf()` still just calls the constructor.
+
+[source,java]
+.java/lang/Double.java (JDK 25)
+----
+    public static Double valueOf(double d) {
+        return new Double(d);
+    }
+----
+
+`Double.valueOf()` in JDK 25 therefore does not return a cached instance, even for small values. Values from -128 to 127, which an integer type would cache, become a new object at every boxing.
+
+== Changes by JDK Version
+
+The way `javac` compiles boxing and unboxing into `valueOf()` and `intValue()` calls has not changed since JDK 5. What has changed, as the table below shows, is the cache implementation, the deprecation status of the constructors, and the range guaranteed by the language specification.
+
+[cols="1,4", options="header"]
+|===
+|JDK Version |Change
+
+|JDK 5
+|Autoboxing and unboxing introduced. Factory methods such as `valueOf(int)` added, and -128 to 127 cached from the start
+
+|JDK 7
+|`IntegerCache` changed to read the `java.lang.Integer.IntegerCache.high` value passed by the HotSpot `-XX:AutoBoxCacheMax` option and use it as the cache upper bound (JDK-6807702)
+
+|JDK 9
+|`@Deprecated(since="9")` added to the wrapper class constructors. The reference identity condition in JLS 5.1.7 changed from the "literals" of SE 8 to "the result of evaluating a constant expression," and `long` joined the covered types
+
+|JDK 12
+|`IntegerCache` and the other box caches stored in the CDS archive and loaded from it at run time when the archive is available (JDK-8209120, JDK-8213033)
+
+|JDK 14
+|`byte` restored to the list of types covered by the reference identity guarantee in JLS 5.1.7 (present in SE 7, missing from SE 8 through 13)
+
+|JDK 16
+|Wrapper classes designated as value-based classes by JEP 390, and their constructors marked `forRemoval = true`
+
+|JDK 22
+|`@Stable` added to the box cache arrays so that the JIT compiler can constant-fold them (JDK-8295555)
+
+|JDK 25
+|`forRemoval` mark removed from the constructors, returning them to ordinary deprecated status (JDK-8354335)
+|===
+
+The JDK versions in this table are those of the first integration into OpenJDK mainline. The `IntegerCache` upper bound setting (JDK-6807702) was backported to 6u14, the CDS archiving (JDK-8209120) to 11.0.6, and the `@Stable` change to the box caches (JDK-8295555) to 21.0.2.
+
+From JDK 16 through JDK 24, while `forRemoval` was set, compiling without any option produced a removal warning. Compiling the same code on JDK 21 and JDK 25 shows the difference.
+
+[source,shell]
+.OldStyle.java compiled with JDK 21 and JDK 25
+----
+$ ~/.sdkman/candidates/java/21.0.8-tem/bin/javac OldStyle.java
+OldStyle.java:3: warning: [removal] Integer(int) in Integer has been deprecated and marked for removal
+        Integer c = new Integer(1);
+                    ^
+OldStyle.java:4: warning: [removal] Double(double) in Double has been deprecated and marked for removal
+        Double d = new Double(1.0);
+                   ^
+2 warnings
+
+$ ~/.sdkman/candidates/java/25-tem/bin/javac OldStyle.java
+Note: OldStyle.java uses or overrides a deprecated API.
+Note: Recompile with -Xlint:deprecation for details.
+----
+
+The wording of JLS 5.1.7 also differed between editions. The third edition of the JLS (Java 5 and 6) and Java SE 7 stated, regardless of whether the value was a literal, that boxing `true`, `false`, a `byte` value, a `char` value from `'\u0000'` to `'\u007f'`, or an `int` or `short` value from -128 to 127 yields the same reference. Java SE 8 narrowed the wording to literals.
+
+[quote, Java Language Specification SE 8, 5.1.7. Boxing Conversion]
+____
+If the value `p` being boxed is an integer literal of type `int` between `-128` and `127` inclusive, or the boolean literal `true` or `false`, or a character literal between `'\u0000'` and `'\u007f'` inclusive, then let `a` and `b` be the results of any two boxing conversions of `p`. It is always the case that `a == b`.
+____
+
+Java SE 9 changed the condition to the result of evaluating a constant expression and added `long` to the covered types. A constant expression that is not a literal, such as the one in `Integer x = 100 + 27;`, is covered in SE 9, unlike in SE 8. The JDK implementation has cached -128 to 127 in `valueOf()` since JDK 5, so the actual behavior was the same under every edition's wording.
+
+== Summary
+
+* The JDK's `javac` compiles autoboxing into `valueOf()` calls and unboxing into calls from the `intValue()` family. No dedicated bytecode instruction exists.
+* `Integer.valueOf()` always caches -128 to 127, and JLS 5.1.7 requires boxing a constant expression in this range to yield the same reference. For `Integer` only, `-XX:AutoBoxCacheMax` can raise the upper bound of the cache.
+* Compare boxed types with `equals()`, not `==`. The result of `==` depends on the size of the value and on runtime options.
+* Wrapper class constructors have been deprecated since JDK 9. Through JDK 8, `javac` gave no warning and you had to rely on FindBugs or IDE checks. Today `javac` reports the deprecation, and Eclipse and IntelliJ IDEA warn with their default settings.
+* Use primitive types where possible, and use boxed types only where an object is required, such as `Collection` elements or generic type arguments (_Effective Java_, 3rd edition, Item 61, "Prefer primitive types to boxed primitives").
+
+== References
+
+* https://docs.oracle.com/javase/specs/jls/se25/html/jls-5.html#jls-5.1.7[JLS 5.1.7: Boxing Conversion]
+* https://docs.oracle.com/en/java/javase/25/docs/api/java.base/java/lang/Integer.html[Integer javadoc]
+* https://github.com/openjdk/jdk/blob/jdk-25%2B36/src/java.base/share/classes/java/lang/Integer.java[JDK 25 Integer.java]
+* https://github.com/openjdk/jdk/blob/jdk-25%2B36/src/java.base/share/classes/java/lang/Double.java[JDK 25 Double.java]
+* https://www.benf.org/other/cfr/[CFR: another Java decompiler]
+* https://spotbugs.readthedocs.io/en/stable/bugDescriptions.html[SpotBugs Bug descriptions]
+* https://www.jetbrains.com/help/inspectopedia/CachedNumberConstructorCall.html[IntelliJ IDEA Inspectopedia: Number constructor call with primitive argument]
+* https://help.eclipse.org/latest/topic/org.eclipse.jdt.doc.user/reference/preferences/java/compiler/ref-preferences-errors-warnings.htm[Eclipse JDT: Java Compiler Errors/Warnings Preferences]
+* https://docs.oracle.com/javase/specs/jls/se8/html/jls-5.html#jls-5.1.7[JLS SE8 5.1.7: Boxing Conversion]
+* https://openjdk.org/jeps/390[JEP 390: Warnings for Value-Based Classes]
+* https://bugs.openjdk.org/browse/JDK-6807702[JDK-6807702: Integer.valueOf cache should be configurable]
+* https://bugs.openjdk.org/browse/JDK-8209120[JDK-8209120: Archive the Integer.IntegerCache]
+* https://bugs.openjdk.org/browse/JDK-8213033[JDK-8213033: Archive remaining primitive box caches]
+* https://bugs.openjdk.org/browse/JDK-8295555[JDK-8295555: Primitive wrapper caches could be @Stable]
+* https://bugs.openjdk.org/browse/JDK-8354335[JDK-8354335: No longer deprecate wrapper class constructors for removal]
+* https://www.oreilly.com/library/view/effective-java/9780134686097/[Effective Java, Third Edition]
